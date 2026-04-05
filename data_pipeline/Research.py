@@ -1,0 +1,121 @@
+from VSXCategoryLoader import VSXCategoryLoader
+from VSX2TESSConverter import VSX2TESSConverter
+from collections import defaultdict
+import pandas as pd
+import logging
+import sys
+import os
+
+class ResearchPipeline:
+    """
+    ResearchPipeline orchestrates the loading of VSX variable-star categories,
+    crossmatching them to the TESS Input Catalog, and writing the resulting
+    TIC IDs to a CSV file for downstream analysis.
+    """
+    def __init__(self, nFamilies = None, nInstances=1000, refreshCache=False, cacheFolder='VSXCache'):
+        self.loader = VSXCategoryLoader(refreshCache=refreshCache, cacheFolder=cacheFolder)
+        self.converter = VSX2TESSConverter()
+        if nFamilies is not None:
+            self.varFamilies = self.loader.getSupportedFamilies()[:nFamilies]
+        else:
+            self.varFamilies = self.loader.getSupportedFamilies()
+        self.nInstances = nInstances
+        self.ticFile = None
+        self.tessMatchedDict = None
+        self.cacheFolder = cacheFolder
+        if not os.path.exists(self.cacheFolder):
+            os.makedirs(self.cacheFolder)
+        
+        self.logger = logging.getLogger()
+
+    def combineVSXTESS(self):
+        #This is a time consuming operation, as it involves crossmatching potentially
+        #thousands of VSX variable stars against the TESS Input Catalog
+        #This function is supposed to called only once to generate the CSV of TIC IDs
+        #for downstream analysis, since the crossmatching step is expensive
+
+        varReq = {fam: self.nInstances for fam in self.varFamilies}
+
+        self.logger.info("Loading categories from VSX")
+        categoryDictionary = self.loader.loadCategories(varReq)
+
+        self.logger.info("Crossmatching categories to TIC")
+        self.tessMatchedDict = self.converter.crossmatchCategoryDictionaryToTic(categoryDictionary)
+        self.tessMatchedDict = {
+            family: stars for family, stars in self.tessMatchedDict.items() if stars
+        }
+        return self.tessMatchedDict
+    
+    def cacheMetadata(self, tessMarchedDict, metadataFile='VSXMetadata.parquet'):
+        df = []
+        for family, stars in tessMarchedDict.items():
+            for star in stars:
+                record = dict(star)
+                df.append(record)
+        df = pd.DataFrame(df)
+        df.to_parquet(self.cacheFolder + os.path.sep + metadataFile, index=False)
+
+    def saveTic(self, tessMatchedDict, ticFile="tess_matched_stars.csv"):   
+        self.ticFile = self.cacheFolder + os.path.sep + ticFile
+        with open(self.ticFile, "w") as f:
+            for family, stars in tessMatchedDict.items():
+                row = ",".join([star.get("ticId") for star in stars])
+                f.write(f"{family},{row}\n")
+
+    def loadTicFile(self, ticFile="tess_matched_stars.csv"):
+        """
+        Loads a previously generated CSV of TIC IDs into memory for downstream analysis.
+        """
+        self.ticFile = self.cacheFolder + os.path.sep + ticFile
+        self.tessMatchedDict = {}
+        with open(self.ticFile, "r") as f:
+            for line in f:
+                family, *ticIds = line.strip().split(",")
+                self.tessMatchedDict[family] = [{"ticId": ticId} for ticId in ticIds]
+        
+        return self.tessMatchedDict
+    
+    def loadCachedMetadata(self, metadataFile="VSXMetadata.parquet"):
+        self.metadataFile = self.cacheFolder + os.path.sep + metadataFile
+        if os.path.exists(self.metadataFile):
+            df = pd.read_parquet(self.metadataFile)
+            self.tessMatchedDict = defaultdict(list)
+            for _, row in df.iterrows():
+                family = row.get("family")
+                if family is not None:
+                    starRecord = row.to_dict()
+                    self.tessMatchedDict[family].append(starRecord)
+            return self.tessMatchedDict
+        else:
+            self.logger.warning(f"Metadata file {self.metadataFile} does not exist.")
+            return None
+    
+    def loadFresh(self):
+        """
+        Runs the full pipeline from scratch: loads VSX categories, crossmatches
+        them to the TESS Input Catalog, and caches both the TIC IDs and metadata
+        for downstream analysis.
+        """
+        tessData = self.combineVSXTESS()
+        self.saveTic(tessData, ticFile="tess_matched_stars.csv")
+        self.cacheMetadata(tessData, metadataFile="VSXMetadata.parquet")
+        return tessData
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        stream=sys.stdout,
+        level=logging.INFO,
+        format="%(levelname)s:%(filename)s:%(lineno)d:%(message)s",
+        force=True,
+    )
+    logger = logging.getLogger()
+
+    if False:
+        pipeline = ResearchPipeline(refreshCache=True)
+        pipeline.loadFresh()
+    else:
+        pipeline = ResearchPipeline()
+        ticDict = pipeline.loadCachedMetadata()
+        for family, stars in ticDict.items():
+            logger.info(f"{family}, Number of stars: {len(stars)}")

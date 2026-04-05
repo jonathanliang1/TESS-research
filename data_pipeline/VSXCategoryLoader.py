@@ -1,18 +1,24 @@
+import sys
+import os
 import re
+import math
 import random
+import time
+import logging
+import xml.etree.ElementTree as ET
+from io import BytesIO
 from collections import defaultdict
 
+import requests
 import numpy as np
 import pandas as pd
-from astropy import units as u
-from astropy.coordinates import SkyCoord
-
-from astroquery.mast import Catalogs
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from astropy.io.votable import parse_single_table
 import lightkurve as lk
 
-
 class VSXCategoryLoader:
-    def __init__(self):
+    def __init__(self, cacheFolder='VSXCache', refreshCache=False):
         """
         VSXCategoryLoader provides a starter curated dictionary that maps raw
         AAVSO VSX variable-star types into broader normalized families that are
@@ -33,8 +39,34 @@ class VSXCategoryLoader:
         Important note
         --------------
         loadCategories() is intentionally family-driven. It is designed to
-        retrieve a requested number of variable stars for each normalized family.
+        retrieve a requested number of variable stars for each normalized family
+        by querying the AAVSO VSX service directly.
         """
+        self.logger = logging.getLogger("VSXCategoryLoader")
+        self.cacheFolder = cacheFolder
+        if not os.path.exists(self.cacheFolder):
+            os.makedirs(self.cacheFolder)
+        self.refreshCache = refreshCache
+
+        self.vsxBaseUrl = "https://www.aavso.org/vsx/index.php"
+        self.httpTimeoutSec = 600
+
+        # Keep a reusable session for VSX traffic and automatically recover
+        # from transient network/server failures.
+        self.httpSession = requests.Session()
+        retryPolicy = Retry(
+            total=3,
+            connect=3,
+            read=3,
+            status=3,
+            backoff_factor=0.5,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(["GET"]),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retryPolicy)
+        self.httpSession.mount("https://", adapter)
+        self.httpSession.mount("http://", adapter)
 
         # ------------------------------------------------------------
         # Raw VSX type -> normalized family
@@ -202,7 +234,7 @@ class VSXCategoryLoader:
                 "recommendedAlgorithm": "BLS",
                 "typicalDifficulty": "easy",
                 "tessUseCase": "Excellent for eclipse and transit-like event detection",
-                "mlNotes": "Distinct morphology and strong benchmark class"
+                "mlNotes": "Distinct morphology and strong benchmark class",
             },
             "ELLIPSOIDAL_ROT": {
                 "displayName": "Rotational / Ellipsoidal Variables",
@@ -211,7 +243,7 @@ class VSXCategoryLoader:
                 "recommendedAlgorithm": "LombScargle",
                 "typicalDifficulty": "medium",
                 "tessUseCase": "Good for smooth periodic recovery tests",
-                "mlNotes": "Can overlap morphologically with pulsators"
+                "mlNotes": "Can overlap morphologically with pulsators",
             },
             "RRLYR": {
                 "displayName": "RR Lyrae Stars",
@@ -220,7 +252,7 @@ class VSXCategoryLoader:
                 "recommendedAlgorithm": "LombScargle",
                 "typicalDifficulty": "easy",
                 "tessUseCase": "Excellent benchmark for period recovery",
-                "mlNotes": "Highly recognizable and astrophysically important"
+                "mlNotes": "Highly recognizable and astrophysically important",
             },
             "DSCT_SXPHE": {
                 "displayName": "Delta Scuti / SX Phoenicis",
@@ -229,7 +261,7 @@ class VSXCategoryLoader:
                 "recommendedAlgorithm": "LombScargle",
                 "typicalDifficulty": "medium",
                 "tessUseCase": "Useful for high-frequency recovery studies",
-                "mlNotes": "Often benefits from careful frequency-domain features"
+                "mlNotes": "Often benefits from careful frequency-domain features",
             },
             "CEPHEID": {
                 "displayName": "Cepheids",
@@ -238,7 +270,7 @@ class VSXCategoryLoader:
                 "recommendedAlgorithm": "LombScargle",
                 "typicalDifficulty": "easy",
                 "tessUseCase": "Strong classical pulsator benchmark",
-                "mlNotes": "Historically important and morphologically structured"
+                "mlNotes": "Historically important and morphologically structured",
             },
             "LONG_PERIOD": {
                 "displayName": "Long-Period Variables",
@@ -247,7 +279,7 @@ class VSXCategoryLoader:
                 "recommendedAlgorithm": "LombScargle",
                 "typicalDifficulty": "hard",
                 "tessUseCase": "Useful edge case because TESS baseline may be limited",
-                "mlNotes": "Long periods may reduce completeness in short baselines"
+                "mlNotes": "Long periods may reduce completeness in short baselines",
             },
             "YSO": {
                 "displayName": "Young Stellar Objects",
@@ -256,7 +288,7 @@ class VSXCategoryLoader:
                 "recommendedAlgorithm": "ML / custom features",
                 "typicalDifficulty": "hard",
                 "tessUseCase": "Stress-test class for irregular variability",
-                "mlNotes": "Important for non-periodic classification experiments"
+                "mlNotes": "Important for non-periodic classification experiments",
             },
             "CV": {
                 "displayName": "Cataclysmic Variables",
@@ -265,7 +297,7 @@ class VSXCategoryLoader:
                 "recommendedAlgorithm": "ML / event detection",
                 "typicalDifficulty": "hard",
                 "tessUseCase": "Useful for accretion-driven outburst behavior",
-                "mlNotes": "Often does not fit simple periodic taxonomy"
+                "mlNotes": "Often does not fit simple periodic taxonomy",
             },
             "XRAY": {
                 "displayName": "X-ray Binaries / High-Energy Systems",
@@ -274,7 +306,7 @@ class VSXCategoryLoader:
                 "recommendedAlgorithm": "ML / custom analysis",
                 "typicalDifficulty": "hard",
                 "tessUseCase": "Rare but scientifically valuable special class",
-                "mlNotes": "Good rare-class challenge set"
+                "mlNotes": "Good rare-class challenge set",
             },
             "UNKNOWN": {
                 "displayName": "Unknown / Unmapped",
@@ -283,8 +315,8 @@ class VSXCategoryLoader:
                 "recommendedAlgorithm": "Review manually",
                 "typicalDifficulty": "unknown",
                 "tessUseCase": "Requires inspection",
-                "mlNotes": "Potential future expansion target"
-            }
+                "mlNotes": "Potential future expansion target",
+            },
         }
 
         # ------------------------------------------------------------
@@ -294,10 +326,48 @@ class VSXCategoryLoader:
         for vsxType, family in self.vsxTypeToFamily.items():
             self.familyToVsxTypes[family].append(vsxType)
 
-        # ------------------------------------------------------------
-        # Mock catalog used for offline structure testing
-        # ------------------------------------------------------------
-        self.mockCatalog = self._buildMockCatalog()
+    def close(self):
+        """
+        Explicitly close network resources held by this loader.
+        """
+        session = getattr(self, "httpSession", None)
+        if session is not None:
+            session.close()
+            self.httpSession = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _httpGetVsxContent(self, params):
+        """
+        Perform one VSX GET request and always close the response object.
+
+        Returns
+        -------
+        bytes
+            Response body content.
+        """
+        time.sleep(5)
+        vsxResponsePath = os.path.join(self.cacheFolder, f"vsx_response_{params['vtype']}.xml")
+        if self.refreshCache or not os.path.exists(vsxResponsePath):
+            self.logger.info("Connecting to VSX to download fresh data...")
+            with self.httpSession.get(
+                self.vsxBaseUrl,
+                params=params,
+                timeout=self.httpTimeoutSec,
+            ) as response:
+                response.raise_for_status()
+                with open(vsxResponsePath, "wb") as f:
+                    f.write(response.content)
+                self.logger.info("VSX data downloaded and cached to %s", vsxResponsePath)
+                return response.content
+        else:
+            self.logger.info("Loading VSX data from cache: %s", vsxResponsePath)
+            with open(vsxResponsePath, "rb") as f:
+                return f.read()
 
     # ============================================================
     # Internal helpers
@@ -319,7 +389,6 @@ class VSXCategoryLoader:
         if not isinstance(vsxType, str):
             return []
 
-        parts = re.split(r"[|+]", vsxType)
         return [
             part.strip().split("/")[0].strip()
             for part in re.split(r"[|+]", vsxType)
@@ -361,7 +430,7 @@ class VSXCategoryLoader:
             "YSO",
             "CV",
             "XRAY",
-            "UNKNOWN"
+            "UNKNOWN",
         ]
 
         for family in priority:
@@ -379,31 +448,6 @@ class VSXCategoryLoader:
         except Exception:
             return defaultValue
 
-    def _buildMockCatalog(self):
-        """
-        Build a small mock catalog for structure testing.
-
-        Each record mimics a minimal VSX-derived star record. In real usage,
-        you would replace this with actual VSX records downloaded from your
-        local file, CSV export, or a custom VSX query layer.
-        """
-        mockCatalog = []
-        rng = random.Random(42)
-
-        return [
-            {
-                "starId": f"{vsxType}_{i}",
-                "starName": f"{vsxType}_STAR_{i}",
-                "vsxType": vsxType,
-                "family": family,
-                "raDeg": 10.0 + rng.random() * 300.0,
-                "decDeg": -70.0 + rng.random() * 140.0
-            }
-            for family, vsxTypes in self.familyToVsxTypes.items()
-            for vsxType in vsxTypes
-            for i in range(60)
-        ]
-
     def _filterRecordsByVsxTypes(self, records, vsxTypes):
         """
         Return records whose raw VSX type belongs to the requested raw VSX set.
@@ -412,6 +456,7 @@ class VSXCategoryLoader:
         types such as 'EA|DSCT' by parsing the record's vsxType field.
         """
         vsxTypeSet = set(vsxTypes)
+
         return [
             record
             for record in records
@@ -421,37 +466,42 @@ class VSXCategoryLoader:
             )
         ]
 
-    def _loadStarsForFamily(self, family, count, records):
+    def _loadStarsForFamily(self, family, count):
         """
-        Load a requested number of stars for one normalized family.
-
-        Parameters
-        ----------
-        family : str
-            Requested normalized family, such as 'ECLIPSING'
-        count : int
-            Number of stars requested
-        records : list[dict]
-            Source records to search
-
-        Returns
-        -------
-        list[dict]
-            A list of star records belonging to that family
+        Load a requested number of stars for one normalized family directly
+        from AAVSO VSX.
         """
         if family not in self.familyToVsxTypes:
             return []
 
         rawVsxTypes = self.familyToVsxTypes[family]
-        matchedRecords = self._filterRecordsByVsxTypes(records, rawVsxTypes)
+        if not rawVsxTypes or count <= 0:
+            return []
 
-        if len(matchedRecords) > count:
-            matchedRecords = random.sample(matchedRecords, count)
+        perTypeTarget = max(1, math.ceil(count / len(rawVsxTypes)))
 
-        return [
-            {**record, "family": family}
-            for record in matchedRecords
-        ]
+        combined = []
+        for rawVsxType in rawVsxTypes:
+            try:
+                typeMatches = self._queryVsxByRawType(family, rawVsxType)
+            except Exception as exc:
+                self.logger.warning("VSX query failed for raw type %s: %s", rawVsxType, exc)
+                continue
+
+            if len(typeMatches) > perTypeTarget:
+                typeMatches = random.sample(typeMatches, perTypeTarget)
+
+            combined.extend(typeMatches)
+
+            if len(self._deduplicateStars(combined)) >= count:
+                break
+
+        combined = self._deduplicateStars(combined)
+
+        if len(combined) > count:
+            combined = random.sample(combined, count)
+
+        return combined
 
     # ============================================================
     # Public metadata helpers
@@ -474,462 +524,207 @@ class VSXCategoryLoader:
         Convenience wrapper for raw VSX type -> single primary family.
         """
         families = self._mapVsxTypeToFamilies(vsxType)
-        return self._pickPrimaryFamily(families)
+        knownFamilies = [family for family in families if family is not None]
+        return self._pickPrimaryFamily(knownFamilies)
 
     # ============================================================
     # Family-driven category loading
     # ============================================================
 
-    def loadCategories(self, categoryRequests, records=None, useMock=True):
+    def loadCategories(self, categoryRequests):
         """
-        Load variable stars by requested normalized family.
+        Load variable stars by requested normalized family directly from VSX.
 
-        This is the main method whose contract is:
-
-            input:
+        Parameters
+        ----------
+        categoryRequests : dict[str, int]
+            Example:
                 {
                     "ECLIPSING": 100,
                     "RRLYR": 50
                 }
 
-            output:
-                {
-                    "ECLIPSING": [starRecord1, starRecord2, ...],
-                    "RRLYR": [starRecord3, starRecord4, ...]
-                }
-
-        Parameters
-        ----------
-        categoryRequests : dict[str, int]
-            Dictionary mapping normalized family name to the number of stars
-            requested for that family.
-
-        records : list[dict] or None
-            Source star records to search. Required when useMock=False.
-
-            Expected record schema:
-            {
-                "starId": ...,
-                "starName": ...,
-                "vsxType": ...,
-                "raDeg": ...,
-                "decDeg": ...
-            }
-
-        useMock : bool
-            If True, search the internal mock catalog.
-            If False, search the provided records list.
-
         Returns
         -------
         dict[str, list[dict]]
-            A dictionary whose keys are requested families and whose values
-            are lists of matching variable-star records.
+            Dictionary mapping each requested family to a list of fetched stars.
         """
-        if useMock:
-            sourceRecords = self.mockCatalog
-        else:
-            if records is None:
-                raise ValueError("When useMock=False, you must provide records.")
-            sourceRecords = records
-
         result = {}
 
         for family, count in categoryRequests.items():
             if family not in self.familyToVsxTypes:
-                print(f"[WARNING] Unsupported family requested: {family}")
+                self.logger.warning("Unsupported family requested: %s", family)
                 result[family] = []
                 continue
 
-            result[family] = self._loadStarsForFamily(
-                family=family,
-                count=count,
-                records=sourceRecords
-            )
+            result[family] = self._loadStarsForFamily(family=family, count=count)
 
         return result
+    
+    def _votableToRowDicts(self, responseContent):
+        """
+        Parse VSX VOTable response bytes into a list of row dictionaries.
+        """
+        # VSX responses can omit strict VOTable typing details for string fields,
+        # which can cause Astropy to truncate values to one character. Parse the
+        # XML table cells directly first to preserve full text values.
+        try:
+            root = ET.fromstring(responseContent)
+            tableElement = root.find(".//{*}TABLE")
+            if tableElement is not None:
+                fieldElements = tableElement.findall("{*}FIELD")
+                columnNames = [
+                    fieldElement.get("name") or fieldElement.get("id") or fieldElement.get("ID")
+                    for fieldElement in fieldElements
+                    if fieldElement.get("name") or fieldElement.get("id") or fieldElement.get("ID")
+                ]
 
-    def buildBalancedCategoryDictionary(self, categoryDictionary, starsPerCategory, randomSeed=42):
+                if columnNames:
+                    rowElements = tableElement.findall(".//{*}TR")
+                    rowDicts = []
+                    for rowElement in rowElements:
+                        rowValues = [
+                            (cell.text or "").strip()
+                            for cell in rowElement.findall("{*}TD")
+                        ]
+                        rowDicts.append({
+                            columnName: (rowValues[index] if index < len(rowValues) else "")
+                            for index, columnName in enumerate(columnNames)
+                        })
+
+                    if rowDicts:
+                        return rowDicts
+        except Exception as exc:
+            self.logger.debug("XML VOTable parsing path failed, falling back to Astropy: %s", exc)
+
+        # Fallback: keep the Astropy path for compatibility.
+        table = parse_single_table(BytesIO(responseContent)).to_table(use_names_over_ids=True)
+        columnNames = list(table.colnames)
+
+        return [
+            {
+                columnName: row[columnName].item() if hasattr(row[columnName], "item") else row[columnName]
+                for columnName in columnNames
+            }
+            for row in table
+        ]
+
+    def _queryVsxByRawType(self, family, rawVsxType):
         """
-        Downsample each family list to a common size for balanced ML work.
+        Query AAVSO VSX for one raw variability type and return normalized records.
         """
-        rng = random.Random(randomSeed)
-        return {
-            family: (
-                rng.sample(stars, starsPerCategory)
-                if len(stars) > starsPerCategory
-                else list(stars)
-            )
-            for family, stars in categoryDictionary.items()
+        params = {
+            "view": "query.votable",
+            "vtype": rawVsxType,
         }
 
-    # ============================================================
-    # TIC crossmatch
-    # ============================================================
+        responseContent = self._httpGetVsxContent(params)
+        rowDicts = self._votableToRowDicts(responseContent)
 
-    def crossmatchToTic(self, starRecord, radiusArcsec=5.0):
-        """
-        Crossmatch one star record to the TESS Input Catalog using RA/Dec.
-
-        Returns
-        -------
-        dict or None
-            A copy of the input record with TIC fields appended,
-            or None if no TIC match is found.
-        """
-        raDeg = starRecord.get("raDeg")
-        decDeg = starRecord.get("decDeg")
-
-        if raDeg is None or decDeg is None:
-            return None
-
-        coord = SkyCoord(ra=raDeg * u.deg, dec=decDeg * u.deg, frame="icrs")
-
-        try:
-            ticTable = Catalogs.query_region(
-                coord,
-                radius=radiusArcsec * u.arcsec,
-                catalog="TIC"
-            )
-        except Exception as exc:
-            print(f"[WARNING] TIC crossmatch failed for {starRecord.get('starName')}: {exc}")
-            return None
-
-        if ticTable is None or len(ticTable) == 0:
-            return None
-
-        try:
-            ticTable.sort("distance")
-        except Exception:
-            pass
-
-        bestMatch = ticTable[0]
-
-        matchedRecord = dict(starRecord)
-        matchedRecord["ticId"] = self._safeTableValue(bestMatch, "ID")
-        matchedRecord["ticRaDeg"] = self._safeTableValue(bestMatch, "ra")
-        matchedRecord["ticDecDeg"] = self._safeTableValue(bestMatch, "dec")
-        matchedRecord["ticTmag"] = self._safeTableValue(bestMatch, "Tmag")
-        matchedRecord["ticDistanceArcmin"] = self._safeTableValue(bestMatch, "distance")
-
-        return matchedRecord
-
-    def crossmatchCategoryDictionaryToTic(self, categoryDictionary, radiusArcsec=5.0):
-        """
-        Crossmatch all stars in a family->stars dictionary to TIC.
-        """
-        result = {}
-
-        for family, stars in categoryDictionary.items():
-            result[family] = [
-                matched
-                for star in stars
-                if (matched := self.crossmatchToTic(star, radiusArcsec)) is not None
-            ]
-
-        return result
-
-    # ============================================================
-    # Lightkurve integration
-    # ============================================================
-
-    def downloadTessLightCurve(
-        self,
-        ticId,
-        author="SPOC",
-        exptime=120,
-        sector=None,
-        fluxColumn="pdcsap_flux",
-        stitch=True
-    ):
-        """
-        Download a TESS light curve for a TIC target using Lightkurve.
-        """
-        targetName = f"TIC {ticId}"
-
-        try:
-            searchResult = lk.search_lightcurve(
-                target=targetName,
-                mission="TESS",
-                author=author,
-                exptime=exptime,
-                sector=sector
-            )
-        except Exception as exc:
-            print(f"[WARNING] search_lightcurve failed for {targetName}: {exc}")
-            return None
-
-        if searchResult is None or len(searchResult) == 0:
-            return None
-
-        try:
-            if stitch:
-                collection = searchResult.download_all()
-                if collection is None or len(collection) == 0:
-                    return None
-                lightCurve = collection.stitch()
-            else:
-                lightCurve = searchResult[0].download()
-        except Exception as exc:
-            print(f"[WARNING] download failed for {targetName}: {exc}")
-            return None
-
-        if lightCurve is None:
-            return None
-
-        try:
-            if hasattr(lightCurve, "select_flux"):
-                lightCurve = lightCurve.select_flux(fluxColumn)
-        except Exception:
-            pass
-
-        return lightCurve
-
-    def preprocessLightCurve(
-        self,
-        lightCurve,
-        doRemoveNans=True,
-        doNormalize=True,
-        doFlatten=False,
-        flattenWindowLength=401,
-        doRemoveOutliers=False,
-        sigma=5.0,
-        doBin=False,
-        timeBinSize=0.01
-    ):
-        """
-        Standard preprocessing helper for TESS light curves.
-
-        Keep this configurable because different science cases benefit from
-        different preprocessing choices.
-        """
-        if lightCurve is None:
-            return None
-
-        processed = lightCurve
-
-        try:
-            if doRemoveNans:
-                processed = processed.remove_nans()
-
-            if doNormalize:
-                processed = processed.normalize()
-
-            if doFlatten:
-                processed = processed.flatten(window_length=flattenWindowLength)
-
-            if doRemoveOutliers:
-                processed = processed.remove_outliers(sigma=sigma)
-
-            if doBin:
-                processed = processed.bin(time_bin_size=timeBinSize)
-
-            if doRemoveNans:
-                processed = processed.remove_nans()
-
-        except Exception as exc:
-            print(f"[WARNING] preprocessLightCurve failed: {exc}")
-            return None
-
-        return processed
-
-    def attachLightCurvesToCategoryDictionary(
-        self,
-        categoryDictionary,
-        author="SPOC",
-        exptime=120,
-        sector=None,
-        fluxColumn="pdcsap_flux",
-        stitch=True,
-        preprocess=True,
-        preprocessConfig=None
-    ):
-        """
-        Download and optionally preprocess TESS light curves for each TIC-matched
-        star in a family->stars dictionary.
-        """
-        if preprocessConfig is None:
-            preprocessConfig = {
-                "doRemoveNans": True,
-                "doNormalize": True,
-                "doFlatten": False,
-                "flattenWindowLength": 401,
-                "doRemoveOutliers": False,
-                "sigma": 5.0,
-                "doBin": False,
-                "timeBinSize": 0.01
-            }
-
-        result = {}
-
-        for family, stars in categoryDictionary.items():
-            enrichedStars = []
-
-            for star in stars:
-                ticId = star.get("ticId")
-                if ticId is None:
-                    continue
-
-                lightCurve = self.downloadTessLightCurve(
-                    ticId=ticId,
-                    author=author,
-                    exptime=exptime,
-                    sector=sector,
-                    fluxColumn=fluxColumn,
-                    stitch=stitch
-                )
-
-                if lightCurve is None:
-                    continue
-
-                if preprocess:
-                    lightCurve = self.preprocessLightCurve(lightCurve, **preprocessConfig)
-
-                if lightCurve is None:
-                    continue
-
-                enrichedStar = dict(star)
-                enrichedStar["lightCurve"] = lightCurve
-                enrichedStars.append(enrichedStar)
-
-            result[family] = enrichedStars
-
-        return result
-
-    # ============================================================
-    # Feature helpers
-    # ============================================================
-
-    def buildFeatureSummary(self, lightCurve, maxCadences=None):
-        """
-        Build a simple scalar summary from a Lightkurve object.
-        """
-        if lightCurve is None:
-            return {
-                "timeArray": None,
-                "fluxArray": None,
-                "numCadences": 0,
-                "meanFlux": np.nan,
-                "stdFlux": np.nan,
-                "amplitude": np.nan,
-                "medianFlux": np.nan,
-                "madFlux": np.nan
-            }
-
-        try:
-            timeArray = np.asarray(lightCurve.time.value)
-            fluxArray = np.asarray(lightCurve.flux.value)
-
-            if maxCadences is not None:
-                timeArray = timeArray[:maxCadences]
-                fluxArray = fluxArray[:maxCadences]
-
-            medianFlux = float(np.nanmedian(fluxArray))
-            madFlux = float(np.nanmedian(np.abs(fluxArray - medianFlux)))
-
-            return {
-                "timeArray": timeArray,
-                "fluxArray": fluxArray,
-                "numCadences": len(fluxArray),
-                "meanFlux": float(np.nanmean(fluxArray)),
-                "stdFlux": float(np.nanstd(fluxArray)),
-                "amplitude": float(np.nanmax(fluxArray) - np.nanmin(fluxArray)),
-                "medianFlux": medianFlux,
-                "madFlux": madFlux
-            }
-
-        except Exception as exc:
-            print(f"[WARNING] buildFeatureSummary failed: {exc}")
-            return {
-                "timeArray": None,
-                "fluxArray": None,
-                "numCadences": 0,
-                "meanFlux": np.nan,
-                "stdFlux": np.nan,
-                "amplitude": np.nan,
-                "medianFlux": np.nan,
-                "madFlux": np.nan
-            }
-
-    # ============================================================
-    # ML dataset builders
-    # ============================================================
-
-    def buildMlDataset(
-        self,
-        categoryDictionary,
-        includeLightCurveArrays=True,
-        includeMetadata=True,
-        maxCadences=None,
-        singleLabel=True
-    ):
-        """
-        Convert a family->stars dictionary into a pandas DataFrame suitable
-        for downstream ML experiments.
-        """
-        rows = []
-
-        for family, stars in categoryDictionary.items():
-            for star in stars:
-                row = {}
-
-                vsxType = star.get("vsxType", "")
-                familyList = self._mapVsxTypeToFamilies(vsxType)
-                primaryFamily = self._pickPrimaryFamily(familyList) if singleLabel else familyList
-                metadata = self.getFamilyMetadata(self._pickPrimaryFamily(familyList))
-
-                if includeMetadata:
-                    row["category"] = family
-                    row["starId"] = star.get("starId")
-                    row["starName"] = star.get("starName")
-                    row["vsxType"] = vsxType
-                    row["ticId"] = star.get("ticId")
-                    row["raDeg"] = star.get("raDeg")
-                    row["decDeg"] = star.get("decDeg")
-                    row["ticRaDeg"] = star.get("ticRaDeg")
-                    row["ticDecDeg"] = star.get("ticDecDeg")
-                    row["ticTmag"] = star.get("ticTmag")
-                    row["familyList"] = familyList
-                    row["primaryFamily"] = primaryFamily
-                    row["familyDisplayName"] = metadata["displayName"]
-                    row["signalType"] = metadata["signalType"]
-                    row["recommendedAlgorithm"] = metadata["recommendedAlgorithm"]
-                    row["typicalDifficulty"] = metadata["typicalDifficulty"]
-
-                if includeLightCurveArrays:
-                    featureSummary = self.buildFeatureSummary(
-                        lightCurve=star.get("lightCurve"),
-                        maxCadences=maxCadences
-                    )
-                    row.update(featureSummary)
-
-                rows.append(row)
-
-        return pd.DataFrame(rows)
-
-    def buildBalancedMlDataset(
-        self,
-        categoryDictionary,
-        starsPerCategory,
-        randomSeed=42,
-        **buildMlDatasetKwargs
-    ):
-        """
-        Build a balanced ML dataframe by first downsampling each requested
-        family to the same number of stars.
-        """
-        balancedDictionary = self.buildBalancedCategoryDictionary(
-            categoryDictionary=categoryDictionary,
-            starsPerCategory=starsPerCategory,
-            randomSeed=randomSeed
-        )
-
-        return self.buildMlDataset(
-            categoryDictionary=balancedDictionary,
-            **buildMlDatasetKwargs
-        )
+        return [
+            self._normalizeVsxRow(rowDict, rawVsxType, family)
+            for rowDict in rowDicts
+        ]
     
+    def _deduplicateStars(self, stars):
+        """
+        Deduplicate combined results across multiple raw VSX types.
+        """
+        seenKeys = set()
+        deduped = []
 
+        for star in stars:
+            key = (
+                star.get("VSXId"),
+                star.get("VSXName"),
+                star.get("raDeg"),
+                star.get("decDeg"),
+            )
+            if key in seenKeys:
+                continue
+            seenKeys.add(key)
+            deduped.append(star)
+
+        return deduped
+    
+    def _pickFirstExistingKey(self, rowDict, candidateKeys):
+        lowerKeyMap = {key.lower(): key for key in rowDict.keys()}
+
+        for candidate in candidateKeys:
+            actualKey = lowerKeyMap.get(candidate.lower())
+            if actualKey is not None:
+                return rowDict.get(actualKey)
+
+        return None
+    
+    def _safeFloat(self, value):
+        try:
+            if value is None or value == "":
+                return None
+            return float(value)
+        except Exception:
+            return None
+    
+    def _parseCoordsJ2000(self, coordText):
+        """
+        Parse VSX 'Coords(J2000)' field formatted like:
+            '11.44133333,41.84172222'
+        into:
+            (raDeg, decDeg)
+        """
+        if isinstance(coordText, bytes):
+            coordText = coordText.decode("utf-8", errors="ignore")
+
+        if not isinstance(coordText, str):
+            return None, None
+
+        coordText = coordText.strip()
+        if not coordText:
+            return None, None
+
+        # Primary expected format from VSX is: "ra,dec".
+        if "," in coordText:
+            parts = [part.strip() for part in coordText.split(",")]
+        else:
+            # Fallback for whitespace-delimited variants.
+            parts = coordText.split()
+
+        if len(parts) != 2:
+            return None, None
+
+        try:
+            raDeg = float(parts[0])
+            decDeg = float(parts[1])
+            return raDeg, decDeg
+        except ValueError:
+            return None, None
+    
+    def _normalizeVsxRow(self, rowDict, requestedRawVsxType, family):
+        """
+        Normalize one VSX VOTable row into the internal record shape.
+        """
+        coordText = self._pickFirstExistingKey(
+            rowDict,
+            ["Coords(J2000)", "radec2000"]
+        )
+        raDeg, decDeg = self._parseCoordsJ2000(coordText)
+
+        VSXId = self._pickFirstExistingKey(rowDict, ["AUID", "Name"])
+        VSXName = self._pickFirstExistingKey(rowDict, ["Name"])
+        vsxType = self._pickFirstExistingKey(rowDict, ["VarType"])
+        period = self._safeFloat(self._pickFirstExistingKey(rowDict, ["Period"]))
+
+        return {
+            "VSXId": VSXId if VSXId not in [None, ""] else VSXName,
+            "VSXName": VSXName,
+            "VSXType": vsxType if vsxType not in [None, ""] else requestedRawVsxType,
+            "period": period,
+            "family": family,
+            "raDeg": raDeg,
+            "decDeg": decDeg,
+            "rawRow": rowDict,
+        }
+    
 if __name__ == "__main__":
     loader = VSXCategoryLoader()
 
@@ -939,37 +734,11 @@ if __name__ == "__main__":
         "DSCT_SXPHE": 20
     }
 
-    categoryDictionary = loader.loadCategories(
-        categoryRequests=categoryRequests,
-        useMock=True
-    )
-
-    for family, stars in categoryDictionary.items():
-        print(family, len(stars))
-        if stars:
-            print(stars[0])
+    categoryDictionary = loader.loadCategories(categoryRequests=categoryRequests)
+    loader.close()
 
     # TIC crossmatch
     ticDictionary = loader.crossmatchCategoryDictionaryToTic(categoryDictionary, radiusArcsec=5.0)
-
-    # Download light curves
-    lightCurveDictionary = loader.attachLightCurvesToCategoryDictionary(
-        ticDictionary,
-        author="SPOC",
-        exptime=120,
-        fluxColumn="pdcsap_flux",
-        stitch=True,
-        preprocess=True
-    )
-
-    # Build balanced ML dataframe
-    mlDataFrame = loader.buildBalancedMlDataset(
-        lightCurveDictionary,
-        starsPerCategory=10,
-        includeLightCurveArrays=True,
-        includeMetadata=True,
-        maxCadences=5000,
-        singleLabel=True
-    )
-
-    print(mlDataFrame.head())
+    for family, stars in ticDictionary.items():
+        for star in stars:
+            print(f"{family} {star.get('VSXName')}: TIC={star.get('ticId')}, VSXId={star.get('VSXId')}")
