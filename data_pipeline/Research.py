@@ -1,5 +1,6 @@
 from VSXCategoryLoader import VSXCategoryLoader
 from VSX2TESSConverter import VSX2TESSConverter
+from TessDataDownloader import TessDataDownloader
 from collections import defaultdict
 import pandas as pd
 import logging
@@ -117,5 +118,16 @@ if __name__ == "__main__":
     else:
         pipeline = ResearchPipeline()
         ticDict = pipeline.loadCachedMetadata()
-        for family, stars in ticDict.items():
-            logger.info(f"{family}, Number of stars: {len(stars)}")
+        # i = 0
+        # tmpticDict = {}
+        # for k, v in ticDict.items():
+        #     tmpticDict[k] = v
+        #     i += 1
+        #     if i >= 2:
+        #         break
+
+        # tessDataloader = TessDataDownloader()
+        # lcurves = tessDataloader.dlSample(tmpticDict, refresh=True)
+        # lcurves
+        tessDataloader = TessDataDownloader()
+        lcurves = tessDataloader.scanAvailability(ticDict)
