@@ -13,9 +13,11 @@ class ResearchPipeline:
     crossmatching them to the TESS Input Catalog, and writing the resulting
     TIC IDs to a CSV file for downstream analysis.
     """
-    def __init__(self, nFamilies = None, nInstances=1000, refreshCache=False, cacheFolder='VSXCache'):
-        self.loader = VSXCategoryLoader(refreshCache=refreshCache, cacheFolder=cacheFolder)
-        self.converter = VSX2TESSConverter()
+    def __init__(self, vsxLoader, tessConverter, nFamilies = None, nInstances=1000, vsxCacheFolder='VSXCache', tessCacheFolder='TESSCache'):
+        self.loader = vsxLoader
+        self.converter = tessConverter
+        self.vsxCacheFolder = vsxCacheFolder
+        self.tessCacheFolder = tessCacheFolder
         if nFamilies is not None:
             self.varFamilies = self.loader.getSupportedFamilies()[:nFamilies]
         else:
@@ -23,10 +25,6 @@ class ResearchPipeline:
         self.nInstances = nInstances
         self.ticFile = None
         self.tessMatchedDict = None
-        self.cacheFolder = cacheFolder
-        if not os.path.exists(self.cacheFolder):
-            os.makedirs(self.cacheFolder)
-        
         self.logger = logging.getLogger()
 
     def combineVSXTESS(self):
@@ -54,20 +52,13 @@ class ResearchPipeline:
                 record = dict(star)
                 df.append(record)
         df = pd.DataFrame(df)
-        df.to_parquet(self.cacheFolder + os.path.sep + metadataFile, index=False)
-
-    def saveTic(self, tessMatchedDict, ticFile="tess_matched_stars.csv"):   
-        self.ticFile = self.cacheFolder + os.path.sep + ticFile
-        with open(self.ticFile, "w") as f:
-            for family, stars in tessMatchedDict.items():
-                row = ",".join([star.get("ticId") for star in stars])
-                f.write(f"{family},{row}\n")
+        df.to_parquet(self.tessCacheFolder + os.path.sep + metadataFile, index=False)
 
     def loadTicFile(self, ticFile="tess_matched_stars.csv"):
         """
         Loads a previously generated CSV of TIC IDs into memory for downstream analysis.
         """
-        self.ticFile = self.cacheFolder + os.path.sep + ticFile
+        self.ticFile = self.tessCacheFolder + os.path.sep + ticFile
         self.tessMatchedDict = {}
         with open(self.ticFile, "r") as f:
             for line in f:
@@ -77,7 +68,7 @@ class ResearchPipeline:
         return self.tessMatchedDict
     
     def loadCachedMetadata(self, metadataFile="VSXMetadata.parquet"):
-        self.metadataFile = self.cacheFolder + os.path.sep + metadataFile
+        self.metadataFile = self.tessCacheFolder + os.path.sep + metadataFile
         if os.path.exists(self.metadataFile):
             df = pd.read_parquet(self.metadataFile)
             self.tessMatchedDict = defaultdict(list)
@@ -88,17 +79,25 @@ class ResearchPipeline:
                     self.tessMatchedDict[family].append(starRecord)
             return self.tessMatchedDict
         else:
-            self.logger.warning(f"Metadata file {self.metadataFile} does not exist.")
-            return None
+            self.logger.error(f"Metadata file {self.metadataFile} does not exist.")
+            return RuntimeError(f"Metadata file {self.metadataFile} does not exist.")
     
-    def loadFresh(self):
+    def loadCandidates(self, fromCache=True):
         """
-        Runs the full pipeline from scratch: loads VSX categories, crossmatches
-        them to the TESS Input Catalog, and caches both the TIC IDs and metadata
-        for downstream analysis.
+        if fromCache is True, attempts to load cached metadata and TIC IDs.
+        If fromCache is False or cached data is unavailable, runs the full pipeline
+        from scratch: loads VSX categories, crossmatches them to the TESS Input Catalog,
+        and caches both the TIC IDs and metadata for downstream analysis.
         """
+        if fromCache:
+            tessData = self.loadCachedMetadata()
+            if tessData is not None:
+                return tessData
+            else:
+                self.logger.error("Cached TESS metadata not found or failed to load. Running full pipeline.")
+                raise RuntimeError("Cached TESS metadata not found or failed to load. Running full pipeline.")
+
         tessData = self.combineVSXTESS()
-        self.saveTic(tessData, ticFile="tess_matched_stars.csv")
         self.cacheMetadata(tessData, metadataFile="VSXMetadata.parquet")
         return tessData
 
@@ -111,23 +110,23 @@ if __name__ == "__main__":
         force=True,
     )
     logger = logging.getLogger()
+    reload = False
 
-    if False:
-        pipeline = ResearchPipeline(refreshCache=True)
-        pipeline.loadFresh()
-    else:
-        pipeline = ResearchPipeline()
-        ticDict = pipeline.loadCachedMetadata()
-        # i = 0
-        # tmpticDict = {}
-        # for k, v in ticDict.items():
-        #     tmpticDict[k] = v
-        #     i += 1
-        #     if i >= 2:
-        #         break
+    vsxLoader = VSXCategoryLoader(refreshCache=reload)
+    tessConverter = VSX2TESSConverter()
 
-        # tessDataloader = TessDataDownloader()
-        # lcurves = tessDataloader.dlSample(tmpticDict, refresh=True)
-        # lcurves
-        tessDataloader = TessDataDownloader()
-        lcurves = tessDataloader.scanAvailability(ticDict)
+    pipeline = ResearchPipeline(vsxLoader, tessConverter)
+    tessCandidates = pipeline.loadCandidates()
+    # i = 0
+    # tmpticDict = {}
+    # for k, v in ticDict.items():
+    #     tmpticDict[k] = v
+    #     i += 1
+    #     if i >= 2:
+    #         break
+
+    tessDataloader = TessDataDownloader()
+    # lcurves = tessDataloader.dlSample(tmpticDict, refresh=True)
+    # lcurves
+    # tessDataloader = TessDataDownloader()
+    # lcurves = tessDataloader.scanAvailability(ticDict)

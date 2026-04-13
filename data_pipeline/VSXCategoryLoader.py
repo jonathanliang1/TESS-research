@@ -308,15 +308,15 @@ class VSXCategoryLoader:
                 "tessUseCase": "Rare but scientifically valuable special class",
                 "mlNotes": "Good rare-class challenge set",
             },
-            "UNKNOWN": {
-                "displayName": "Unknown / Unmapped",
-                "physicalMechanism": "Unspecified",
-                "signalType": "Unspecified",
-                "recommendedAlgorithm": "Review manually",
-                "typicalDifficulty": "unknown",
-                "tessUseCase": "Requires inspection",
-                "mlNotes": "Potential future expansion target",
-            },
+            # "UNKNOWN": {
+            #     "displayName": "Unknown / Unmapped",
+            #     "physicalMechanism": "Unspecified",
+            #     "signalType": "Unspecified",
+            #     "recommendedAlgorithm": "Review manually",
+            #     "typicalDifficulty": "unknown",
+            #     "tessUseCase": "Requires inspection",
+            #     "mlNotes": "Potential future expansion target",
+            # },
         }
 
         # ------------------------------------------------------------
@@ -736,9 +736,3 @@ if __name__ == "__main__":
 
     categoryDictionary = loader.loadCategories(categoryRequests=categoryRequests)
     loader.close()
-
-    # TIC crossmatch
-    ticDictionary = loader.crossmatchCategoryDictionaryToTic(categoryDictionary, radiusArcsec=5.0)
-    for family, stars in ticDictionary.items():
-        for star in stars:
-            print(f"{family} {star.get('VSXName')}: TIC={star.get('ticId')}, VSXId={star.get('VSXId')}")

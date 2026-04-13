@@ -17,9 +17,13 @@ class VSX2TESSConverter:
     def __init__(self):
         self.logger = logging.getLogger("VSX2TESSConverter")
 
-    def crossmatchToTic(self, starRecord, radiusArcsec=5.0):
+    def crossmatchToTic(self, starRecord, radiusArcsec=5.0, maxMatches=5):
         """
         Crossmatch AAVSO VSX variable-star record to the TESS Input Catalog using RA/Dec.
+
+        The returned record includes a `ticMatches` list containing up to
+        `maxMatches` candidates sorted by angular separation from the VSX target.
+        Each candidate has: ticId, ticRaDeg, ticDecDeg, ticTmag, ticDistanceArcmin.
 
         Returns
         -------
@@ -54,39 +58,46 @@ class VSX2TESSConverter:
 
         # TIC query results do not always provide a query-center "distance"
         # column, so compute angular separation explicitly from RA/Dec.
-        raColumnName = "ra" if "ra" in ticTable.colnames else None
-        decColumnName = "dec" if "dec" in ticTable.colnames else None
+        hasRa = "ra" in ticTable.colnames
+        hasDec = "dec" in ticTable.colnames
 
-        bestMatch = None
-        bestSeparationArcsec = None
-
-        if raColumnName is not None and decColumnName is not None:
+        ticCandidates = []
+        if hasRa and hasDec:
             for row in ticTable:
                 try:
+                    ticRaDeg = float(row["ra"])
+                    ticDecDeg = float(row["dec"])
+                    ticTmag = float(row["Tmag"])
+
+                    
                     ticCoord = SkyCoord(
-                        ra=float(row[raColumnName]) * u.deg,
-                        dec=float(row[decColumnName]) * u.deg,
-                        frame="icrs",
+                        ra=float(ticRaDeg) * u.deg,
+                        dec=float(ticDecDeg) * u.deg,
+                        frame="icrs"
                     )
-                    separationArcsec = coord.separation(ticCoord).arcsec
+                    separationArcsec = float(coord.separation(ticCoord).arcsec)
                 except Exception:
                     continue
 
-                if bestSeparationArcsec is None or separationArcsec < bestSeparationArcsec:
-                    bestSeparationArcsec = separationArcsec
-                    bestMatch = row
+                ticCandidates.append(
+                    {
+                        "ticId": str(row["ID"]),
+                        "ticRaDeg": ticRaDeg,
+                        "ticDecDeg": ticDecDeg,
+                        "ticTmag": ticTmag,
+                        "ticDistanceArcmin": separationArcsec / 60.0,
+                    }
+                )
 
-        if bestMatch is None:
-            bestMatch = ticTable[0]
+        if not ticCandidates:
+            return None
+
+        maxMatches = max(1, int(maxMatches))
+        ticCandidates.sort(key=lambda candidate: candidate["ticDistanceArcmin"])
+        topCandidates = ticCandidates[:maxMatches]
 
         matchedRecord = dict(starRecord)
-        matchedRecord["ticId"] = bestMatch["ID"]
-        matchedRecord["ticRaDeg"] = bestMatch["ra"]
-        matchedRecord["ticDecDeg"] = bestMatch["dec"]
-        matchedRecord["ticTmag"] = bestMatch["Tmag"]
-        matchedRecord["ticDistanceArcmin"] = (
-            bestSeparationArcsec / 60.0 if bestSeparationArcsec is not None else None
-        )
+        matchedRecord["ticMatches"] = topCandidates
         matchedRecord['VSXId'] = starRecord.get('VSXId')
         matchedRecord['VSXName'] = starRecord.get('VSXName')
         matchedRecord['VSXType'] = starRecord.get('VSXType')
