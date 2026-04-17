@@ -101,6 +101,38 @@ class ResearchPipeline:
         self.cacheMetadata(tessData, metadataFile="VSXMetadata.parquet")
         return tessData
 
+    def countBestMatchesByFamily(self, tessMetadataParquet):
+        """
+        Count stars with a valid bestMatch for each family from cached parquet metadata.
+
+        Returns:
+            tuple[dict[str, int], int]:
+                - per_family_count: number of stars with bestMatch found in each family
+                - total_best_matches: total number of stars with bestMatch found
+        """
+        df = pd.read_parquet(tessMetadataParquet)
+
+        required_columns = {"family", "bestMatch"}
+        missing_columns = required_columns - set(df.columns)
+        if missing_columns:
+            raise ValueError(
+                f"Missing required columns in {tessMetadataParquet}: {sorted(missing_columns)}"
+            )
+
+        # Treat null/NaN and literal string 'None' as no match.
+        has_match = df["bestMatch"].notna() & (df["bestMatch"].astype(str) != "None")
+
+        per_family_count = (
+            df.loc[has_match]
+            .groupby("family")
+            .size()
+            .astype(int)
+            .to_dict()
+        )
+        total_best_matches = int(has_match.sum())
+
+        return per_family_count, total_best_matches
+
 
 if __name__ == "__main__":
     logging.basicConfig(
@@ -116,15 +148,12 @@ if __name__ == "__main__":
     tessConverter = VSX2TESSConverter()
 
     pipeline = ResearchPipeline(vsxLoader, tessConverter)
-    tessCandidates = pipeline.loadCandidates()
-    # i = 0
-    # tmpticDict = {}
-    # for k, v in ticDict.items():
-    #     tmpticDict[k] = v
-    #     i += 1
-    #     if i >= 2:
-    #         break
-
+    tessMetadata = pipeline.loadCandidates()
+    print("TESS Metadata loaded for %d variable star candidates across %d families" % (sum(len(stars) for stars in tessMetadata.values()), len(tessMetadata)))
+    stat, total = pipeline.countBestMatchesByFamily(pipeline.tessCacheFolder + os.path.sep + "VSXMetadata.parquet")
+    for family, count in stat.items():
+        print(f"Family {family}: {count} stars with bestMatch, out of {len(tessMetadata.get(family, []))} total stars in family")
+    print(f"Total stars with bestMatch: {total} out of {sum(len(stars) for stars in tessMetadata.values())} candidates")
     tessDataloader = TessDataDownloader()
     # lcurves = tessDataloader.dlSample(tmpticDict, refresh=True)
     # lcurves

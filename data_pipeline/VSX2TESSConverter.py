@@ -1,6 +1,6 @@
 from astropy.coordinates import SkyCoord
 from astropy import units as u
-from astroquery.mast import Catalogs
+from astroquery.mast import Catalogs, Observations
 import logging
 
 class VSX2TESSConverter:
@@ -93,11 +93,12 @@ class VSX2TESSConverter:
             return None
 
         maxMatches = max(1, int(maxMatches))
+        #be sure to sort by ticDistanceArcmin
         ticCandidates.sort(key=lambda candidate: candidate["ticDistanceArcmin"])
         topCandidates = ticCandidates[:maxMatches]
 
         matchedRecord = dict(starRecord)
-        matchedRecord["ticMatches"] = topCandidates
+        matchedRecord["ticCandidates"] = topCandidates
         matchedRecord['VSXId'] = starRecord.get('VSXId')
         matchedRecord['VSXName'] = starRecord.get('VSXName')
         matchedRecord['VSXType'] = starRecord.get('VSXType')
@@ -120,7 +121,95 @@ class VSX2TESSConverter:
                 if (matchedRecord := self.crossmatchToTic(star, radiusArcsec=radiusArcsec)) is not None
             ]
 
+        self.findBestMatches(result)
+
         return result
+    
+    def findBestMatches(self, categoryDictionary, batchSize=200):
+        """
+        For each star, inspect TIC candidates in distance order and choose the first
+        one with an available TESS light curve, preferring SPOC over QLP.
+        Adds a 'bestMatch' field with {ticId, author}, or None if neither author exists.
+        """
+        def _normalize_tic(value):
+            if value is None:
+                return None
+            digits = "".join(ch for ch in str(value) if ch.isdigit())
+            if not digits:
+                return None
+            return str(int(digits))
+
+        def _chunked(items, chunkSize):
+            for idx in range(0, len(items), chunkSize):
+                yield items[idx : idx + chunkSize]
+
+        uniqueTicIds = sorted(
+            {
+                _normalize_tic(candidate.get("ticId"))
+                for stars in categoryDictionary.values()
+                for star in stars
+                for candidate in star.get("ticCandidates", [])
+                if _normalize_tic(candidate.get("ticId")) is not None
+            }
+        )
+
+        ticAvailability = {
+            ticId: {"SPOC": False, "QLP": False}
+            for ticId in uniqueTicIds
+        }
+
+        batchSize = max(1, int(batchSize))
+        for ticBatch in _chunked(uniqueTicIds, batchSize):
+            try:
+                observations = Observations.query_criteria(
+                    project=["TESS"],
+                    provenance_name=["SPOC", "QLP"],
+                    dataproduct_type=["timeseries", "cube"],
+                    target_name=[ticId.zfill(9) for ticId in ticBatch],
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "Availability query failed for TIC batch of size %d: %s",
+                    len(ticBatch),
+                    exc,
+                )
+                continue
+
+            if observations is None:
+                continue
+
+            for row in observations:
+                ticId = _normalize_tic(row.get("target_name"))
+                author = str(row.get("provenance_name", "")).strip().upper()
+                if ticId not in ticAvailability or author not in {"SPOC", "QLP"}:
+                    continue
+                ticAvailability[ticId][author] = True
+
+        for family, stars in categoryDictionary.items():
+            for star in stars:
+                ticCandidates = star.get("ticCandidates", [])
+                star["bestMatch"] = None
+
+                for candidate in ticCandidates:
+                    ticId = _normalize_tic(candidate.get("ticId"))
+                    if ticId is None:
+                        continue
+
+                    availability = ticAvailability.get(ticId, {"SPOC": False, "QLP": False})
+
+                    if availability.get("SPOC"):
+                        star["bestMatch"] = {
+                            "ticId": ticId,
+                            "author": "SPOC",
+                        }
+                        break
+
+                    if availability.get("QLP"):
+                        star["bestMatch"] = {
+                            "ticId": ticId,
+                            "author": "QLP",
+                        }
+                        break
     
 
 if __name__ == "__main__":

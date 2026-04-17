@@ -5,6 +5,9 @@ import os
 import sys
 import time
 import shutil
+import numpy as np
+from astropy.coordinates import SkyCoord
+from astropy import units as u
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 class TessDataDownloader:
@@ -19,268 +22,6 @@ class TessDataDownloader:
         if not os.path.exists(self.tessCacheFolder):
             os.makedirs(self.tessCacheFolder)
 
-    def scanAvailability(
-        self,
-        tessMetadata,
-        maxWorkers=6,
-        minQueryIntervalSec=0.25,
-        maxRetries=1,
-        retryBackoffBaseSec=1.0,
-        batchSize=200,
-    ):
-        from astroquery.mast import Observations
-
-        def _is_rate_limited_error(exc):
-            statusCode = getattr(getattr(exc, "response", None), "status_code", None)
-            if statusCode == 429:
-                return True
-            return "429" in str(exc) or "Too Many Requests" in str(exc)
-
-        def _normalize_tic(value):
-            if value is None:
-                return None
-            digits = "".join(ch for ch in str(value) if ch.isdigit())
-            if not digits:
-                return None
-            return str(int(digits))
-
-        def _chunked(items, chunkSize):
-            for idx in range(0, len(items), chunkSize):
-                yield items[idx : idx + chunkSize]
-
-        def _query_target_names(targetNames, logLabel):
-            targetCount = len(targetNames)
-            if targetCount == 0:
-                return []
-
-            for attempt in range(maxRetries + 1):
-                try:
-                    observations = Observations.query_criteria(
-                        project=["TESS"],
-                        provenance_name=["SPOC", "QLP"],
-                        dataproduct_type=["cube", "timeseries"],
-                        target_name=targetNames,
-                    )
-                    if observations is None:
-                        return []
-                    return [row for row in observations]
-                except Exception as exc:
-                    if attempt < maxRetries and _is_rate_limited_error(exc):
-                        sleepSec = retryBackoffBaseSec * (2 ** attempt)
-                        self.logger.warning(
-                            "429 during %s (%d TICs). Retrying in %.1fs (attempt %d/%d)",
-                            logLabel,
-                            targetCount,
-                            sleepSec,
-                            attempt + 1,
-                            maxRetries,
-                        )
-                        time.sleep(sleepSec)
-                        continue
-                    self.logger.error("%s failed (%d TICs): %s", logLabel, targetCount, exc)
-                    return None
-
-        def _query_chunk(chunkIndex, targetNames):
-            # Stagger requests from worker threads to reduce burst traffic.
-            staggerDelaySec = minQueryIntervalSec * (chunkIndex % max(1, int(maxWorkers)))
-            if staggerDelaySec > 0:
-                time.sleep(staggerDelaySec)
-
-            return _query_target_names(targetNames, f"bulk chunk {chunkIndex}")
-
-        starRefs = []
-        familyCounts = {family: 0 for family in tessMetadata}
-        familyQueriedCounts = {family: 0 for family in tessMetadata}
-        availCount = 0
-        totalCount = 0
-        maxWorkers = max(1, int(maxWorkers))
-
-        for family, stars in tessMetadata.items():
-            totalCount += len(stars)
-            for star in stars:
-                star["author"] = None
-                cleanTicId = _normalize_tic(star.get("ticId"))
-                if cleanTicId is None:
-                    continue
-                familyQueriedCounts[family] += 1
-                starRefs.append((family, star, cleanTicId))
-
-        if not starRefs:
-            self.logger.info("No valid TIC IDs to scan.")
-            return
-
-        uniqueTicIds = sorted({cleanTicId for _, _, cleanTicId in starRefs})
-        chunks = list(_chunked(uniqueTicIds, max(1, int(batchSize))))
-        authorPriority = {"SPOC": 2, "QLP": 1}
-        bestAuthorByTic = {}
-
-        with ThreadPoolExecutor(max_workers=maxWorkers) as executor:
-            futures = {
-                executor.submit(
-                    _query_chunk,
-                    chunkIndex,
-                    [ticId.zfill(9) for ticId in ticChunk],
-                ): chunkIndex
-                for chunkIndex, ticChunk in enumerate(chunks)
-            }
-
-            for future in as_completed(futures):
-                rows = future.result()
-                if rows is None or len(rows) == 0:
-                    continue
-
-                for row in rows:
-                    rowAuthor = str(row["provenance_name"]).strip().upper()
-                    if rowAuthor not in authorPriority:
-                        continue
-                    rowTic = _normalize_tic(row["target_name"])
-                    if rowTic is None:
-                        continue
-                    prevAuthor = bestAuthorByTic.get(rowTic)
-                    if prevAuthor is None or authorPriority[rowAuthor] > authorPriority.get(prevAuthor, 0):
-                        bestAuthorByTic[rowTic] = rowAuthor
-
-        for family, star, cleanTicId in starRefs:
-            author = bestAuthorByTic.get(cleanTicId)
-            if author is not None:
-                star["author"] = author
-                familyCounts[family] += 1
-                availCount += 1
-
-        for family, lcCount in familyCounts.items():
-            queriedCount = familyQueriedCounts.get(family, 0)
-            self.logger.info(
-                f"Found {lcCount} light curves for family {family} out of {queriedCount} stars queried"
-            )
-        self.logger.info(
-            f"Completed scanning availability of light curves. Total {availCount} light curves found out of {totalCount} stars."
-        )
-        
-    def dlSample(self, tessMetadata, product = 0, flux="pdcsap_flux", author="SPOC", refresh=False):
-        """
-        Download light curves for TIC IDs with specified product and flux column from the TESS mission.
-        
-        Args:
-            tessMetadata (dict): Dictionary mapping stellar categories to lists of TIC IDs to download.
-            product (int, optional): TESS data product to download (default is 0).
-            flux (str, optional): Name of the flux column to retrieve from the light curve (default is "pdcsap_flux").
-            
-        Returns:
-            dict: Nested dictionary with structure {category: {ticId: lightCurve}}
-                where category is the variable star family, ticId is the TIC ID as string,
-                and lightCurve is the downloaded lightkurve object
-        """
-        try:
-            resultDict = {}
-            for family, stars in tessMetadata.items():
-                self.logger.info(f"Processing {family}")
-                resultDict[family] = {}
-                for star in stars:
-                    # Clean the TIC ID string (remove 'TIC ' prefix if present)
-                    ticId = star.get("ticId")
-                    cleanTicId = str(ticId).replace('TIC ', '').strip()                    
-                    cacheFileSuffix = f"{flux}_{product}"
-                    
-                    try:
-                        cacheFilePath = os.path.join(self.tessCacheFolder, f"TIC_{cleanTicId}_{cacheFileSuffix}.FITS")        
-                        lightCurve = None
-                        if refresh or not os.path.exists(cacheFilePath):
-                            self.logger.info(f"Downloading light curve for TIC {cleanTicId}")
-                            
-                            # Search for and download the light curve
-                            searchResult = None
-                            searchResult = lk.search_lightcurve(f"TIC {cleanTicId}", 
-                                                                mission='TESS',
-                                                                author=author)                            
-                            if len(searchResult) > 0:
-                                # Download the first available light curve
-                                lightCurve = searchResult[product].download().select_flux(flux)# Cache the downloaded light curve in npz format                                  
-                                self.logger.info(f"Successfully downloaded light curve for TIC {cleanTicId}")
-                                try:
-                                    shutil.move(lightCurve.filename, cacheFilePath)
-                                    self.logger.info(f"Cached light curve for TIC {cleanTicId} at {cacheFilePath}")
-                                except Exception as cacheError:
-                                    self.logger.error(f"Error caching light curve for TIC {cleanTicId}: {cacheError}")
-                            else:
-                                self.logger.warning(f"No light curve data found for TIC {cleanTicId}")
-                        else:
-                            # load previously cached light curve from TESSCache, in FITS format
-                            try:
-                                lightCurve = lk.read(cacheFilePath).select_flux(flux)
-                                self.logger.info(f"Loaded cached light curve for TIC {cleanTicId}")
-                            except Exception as cacheError:
-                                self.logger.error(f"Error loading cached light curve for TIC {cleanTicId}: {cacheError}")
-                                lightCurve = None
-                        resultDict[family][cleanTicId] = lightCurve
-                            
-                    except Exception as downloadError:
-                        self.logger.error(f"Error downloading light curve for TIC {cleanTicId}: {downloadError}")
-                        resultDict[family][cleanTicId] = None
-            
-            return resultDict
-            
-        except Exception as fileError:
-            self.logger.error(f"Error reading parquet file {tessMetadata}: {fileError}")
-            raise
-
-    
-    # ============================================================
-    # Lightkurve integration
-    # ============================================================
-
-    def downloadTessLightCurve(
-        self,
-        ticId,
-        author="SPOC",
-        exptime=120,
-        sector=None,
-        fluxColumn="pdcsap_flux",
-        stitch=True,
-    ):
-        """
-        Download a TESS light curve for a TIC target using Lightkurve.
-        """
-        targetName = f"TIC {ticId}"
-
-        try:
-            searchResult = lk.search_lightcurve(
-                target=targetName,
-                mission="TESS",
-                author=author,
-                exptime=exptime,
-                sector=sector,
-            )
-        except Exception as exc:
-            self.logger.warning("search_lightcurve failed for %s: %s", targetName, exc)
-            return None
-
-        if searchResult is None or len(searchResult) == 0:
-            return None
-
-        try:
-            if stitch:
-                collection = searchResult.download_all()
-                if collection is None or len(collection) == 0:
-                    return None
-                lightCurve = collection.stitch()
-            else:
-                lightCurve = searchResult[0].download()
-        except Exception as exc:
-            self.logger.warning("download failed for %s: %s", targetName, exc)
-            return None
-
-        if lightCurve is None:
-            return None
-
-        try:
-            if hasattr(lightCurve, "select_flux"):
-                lightCurve = lightCurve.select_flux(fluxColumn)
-        except Exception:
-            pass
-
-        return lightCurve
-    
-    
     def preprocessLightCurve(
         self,
         lightCurve,
@@ -329,68 +70,336 @@ class TessDataDownloader:
 
         return processed
 
-    def attachLightCurvesToCategoryDictionary(
+    def _resolveMetadataPath(self, tessMetadataParquet):
+        if os.path.isabs(tessMetadataParquet):
+            return tessMetadataParquet
+
+        cachePath = os.path.join(self.tessCacheFolder, tessMetadataParquet)
+        if os.path.exists(cachePath):
+            return cachePath
+
+        return tessMetadataParquet
+
+    def _normalizeTicId(self, value):
+        if value is None:
+            return None
+
+        try:
+            if pd.isna(value):
+                return None
+        except TypeError:
+            pass
+
+        digits = "".join(ch for ch in str(value) if ch.isdigit())
+        if not digits:
+            return None
+
+        return str(int(digits))
+
+    def _sortedTicCandidates(self, ticCandidates):
+        if ticCandidates is None:
+            return []
+
+        if isinstance(ticCandidates, float) and pd.isna(ticCandidates):
+            return []
+
+        if hasattr(ticCandidates, "tolist"):
+            ticCandidates = ticCandidates.tolist()
+
+        if isinstance(ticCandidates, dict):
+            ticCandidates = [ticCandidates]
+
+        normalizedCandidates = []
+        for candidate in ticCandidates or []:
+            if candidate is None:
+                continue
+            normalizedCandidates.append(dict(candidate))
+
+        normalizedCandidates.sort(
+            key=lambda candidate: float(candidate.get("ticDistanceArcmin", float("inf")))
+        )
+        return normalizedCandidates
+
+    def _lightCurveFromSearchResult(self, searchResult):
+        if searchResult is None or len(searchResult) == 0:
+            return None
+
+        try:
+            downloaded = searchResult.download_all(download_dir=self.tessCacheFolder)
+        except Exception:
+            downloaded = searchResult.download(download_dir=self.tessCacheFolder)
+
+        if downloaded is None:
+            return None
+
+        if isinstance(downloaded, lk.LightCurveCollection):
+            if len(downloaded) == 0:
+                return None
+            try:
+                return downloaded.stitch()
+            except Exception as exc:
+                self.logger.warning("Failed to stitch light-curve collection: %s", exc)
+                return downloaded[0]
+
+        return downloaded
+
+    def _downloadCatalogLightCurve(self, ticId, author):
+        try:
+            searchResult = lk.search_lightcurve(
+                f"TIC {ticId}",
+                mission="TESS",
+                author=author,
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "search_lightcurve failed for TIC %s author %s: %s",
+                ticId,
+                author,
+                exc,
+            )
+            return None
+
+        if searchResult is None or len(searchResult) == 0:
+            return None
+
+        lightCurve = self._lightCurveFromSearchResult(searchResult)
+        if lightCurve is None:
+            return None
+
+        outputFile = os.path.join(self.tessCacheFolder, f"TIC_{ticId}_{author}.fits")
+        lightCurve.to_fits(path=outputFile, overwrite=True)
+
+        sectors = []
+        if hasattr(searchResult, "table") and "sequence_number" in searchResult.table.colnames:
+            sectors = [
+                int(sector)
+                for sector in searchResult.table["sequence_number"]
+                if sector is not None and str(sector) != "--"
+            ]
+
+        return {
+            "bestMatch": {"ticId": ticId, "author": author},
+            "provenance": author,
+            "lightCurvePath": outputFile,
+            "lightCurveAvailable": True,
+            "extractionMetadata": {
+                "downloadMethod": "search_lightcurve",
+                "author": author,
+                "productCount": int(len(searchResult)),
+                "sectors": sectors,
+            },
+        }
+
+    def _extractTessCutLightCurve(self, starRecord, ticCandidates, cutoutSize):
+        raDeg = starRecord.get("raDeg")
+        decDeg = starRecord.get("decDeg")
+        if raDeg is None or decDeg is None:
+            return None
+
+        try:
+            coord = SkyCoord(ra=float(raDeg) * u.deg, dec=float(decDeg) * u.deg, frame="icrs")
+        except Exception as exc:
+            self.logger.warning(
+                "Invalid sky coordinates for %s: %s",
+                starRecord.get("VSXName", starRecord.get("VSXId", "unknown")),
+                exc,
+            )
+            return None
+
+        try:
+            searchResult = lk.search_tesscut(coord)
+        except Exception as exc:
+            self.logger.warning(
+                "search_tesscut failed for %s: %s",
+                starRecord.get("VSXName", starRecord.get("VSXId", "unknown")),
+                exc,
+            )
+            return None
+
+        if searchResult is None or len(searchResult) == 0:
+            return None
+
+        try:
+            tpfCollection = searchResult.download_all(
+                cutout_size=cutoutSize,
+                download_dir=self.tessCacheFolder,
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "TESSCut download failed for %s: %s",
+                starRecord.get("VSXName", starRecord.get("VSXId", "unknown")),
+                exc,
+            )
+            return None
+
+        if tpfCollection is None or len(tpfCollection) == 0:
+            return None
+
+        extractedCurves = []
+        aperturePixelCounts = []
+        sectors = []
+
+        for tpf in tpfCollection:
+            try:
+                apertureMask = tpf.create_threshold_mask(threshold=3, reference_pixel="center")
+                if apertureMask is None or not np.any(apertureMask):
+                    apertureMask = np.zeros(tpf.flux[0].shape, dtype=bool)
+                    apertureMask[apertureMask.shape[0] // 2, apertureMask.shape[1] // 2] = True
+
+                lightCurve = tpf.to_lightcurve(aperture_mask=apertureMask).remove_nans()
+                if len(lightCurve) == 0:
+                    continue
+
+                extractedCurves.append(lightCurve)
+                aperturePixelCounts.append(int(np.sum(apertureMask)))
+
+                sector = getattr(tpf, "sector", None)
+                if sector is not None:
+                    sectors.append(int(sector))
+            except Exception as exc:
+                self.logger.warning(
+                    "Aperture photometry failed for %s in one TESSCut sector: %s",
+                    starRecord.get("VSXName", starRecord.get("VSXId", "unknown")),
+                    exc,
+                )
+
+        if not extractedCurves:
+            return None
+
+        if len(extractedCurves) == 1:
+            stitched = extractedCurves[0]
+        else:
+            try:
+                stitched = lk.LightCurveCollection(extractedCurves).stitch()
+            except Exception as exc:
+                self.logger.warning("Failed to stitch TESSCut light curves: %s", exc)
+                stitched = extractedCurves[0]
+
+        stitched = stitched.remove_nans()
+        if len(stitched) == 0:
+            return None
+
+        preferredCandidate = ticCandidates[0] if ticCandidates else {}
+        chosenTicId = self._normalizeTicId(preferredCandidate.get("ticId")) or "NA"
+
+        outputFile = os.path.join(self.tessCacheFolder, f"TIC_{chosenTicId}_TESSCut.fits")
+        stitched.to_fits(path=outputFile, overwrite=True)
+
+        return {
+            "bestMatch": {"ticId": chosenTicId, "author": "TESSCut"},
+            "provenance": "TESSCut",
+            "lightCurvePath": outputFile,
+            "lightCurveAvailable": True,
+            "extractionMetadata": {
+                "downloadMethod": "search_tesscut",
+                "sourceRaDeg": float(raDeg),
+                "sourceDecDeg": float(decDeg),
+                "cutoutSize": list(cutoutSize),
+                "sectorCount": len(extractedCurves),
+                "sectors": sectors,
+                "aperturePixelCounts": aperturePixelCounts,
+                "selectedCandidateTicId": chosenTicId,
+                "selectedCandidateDistanceArcmin": preferredCandidate.get("ticDistanceArcmin"),
+                "extractionMethod": "threshold_mask_photometry",
+            },
+        }
+
+    def downloadTessLightCurves(
         self,
-        categoryDictionary,
-        author="SPOC",
-        exptime=120,
-        sector=None,
-        fluxColumn="pdcsap_flux",
-        stitch=True,
-        preprocess=True,
-        preprocessConfig=None,
+        tessMetadataParquet,
+        augmentedMetadataFile="TESSAugmented.parquet",
+        cutoutSize=(15, 15),
     ):
         """
-        Download and optionally preprocess TESS light curves for each TIC-matched
-        star in a family->stars dictionary.
+        Download or extract TESS light curves for each star in cached metadata.
+
+        The method first tries TIC candidates in angular-separation order using
+        SPOC then QLP products. If neither exists, it falls back to TESSCut using
+        the original VSX coordinates and writes augmented metadata to parquet.
         """
-        if preprocessConfig is None:
-            preprocessConfig = {
-                "doRemoveNans": True,
-                "doNormalize": True,
-                "doFlatten": False,
-                "flattenWindowLength": 401,
-                "doRemoveOutliers": False,
-                "sigma": 5.0,
-                "doBin": False,
-                "timeBinSize": 0.01,
-            }
+        metadataPath = self._resolveMetadataPath(tessMetadataParquet)
+        df = pd.read_parquet(metadataPath)
 
-        result = {}
+        requiredColumns = {"family", "raDeg", "decDeg", "ticCandidates"}
+        missingColumns = requiredColumns - set(df.columns)
+        if missingColumns:
+            raise ValueError(
+                f"Missing required columns in {metadataPath}: {sorted(missingColumns)}"
+            )
 
-        for family, stars in categoryDictionary.items():
-            enrichedStars = []
+        for column in [
+            "bestMatch",
+            "provenance",
+            "lightCurvePath",
+            "extractionMetadata",
+            "lightCurveAvailable",
+            "noLightCurveReason",
+        ]:
+            if column not in df.columns:
+                df[column] = [None] * len(df)
 
-            for star in stars:
-                ticId = star.get("ticId")
+        orderedIndices = df.sort_values(["family", "VSXName"], na_position="last").index.tolist()
+        currentFamily = None
+
+        for count, idx in enumerate(orderedIndices, start=1):
+            row = df.loc[idx]
+            family = row.get("family")
+            if family != currentFamily:
+                currentFamily = family
+                self.logger.info("Processing family %s", family)
+
+            starName = row.get("VSXName", row.get("VSXId", f"row-{idx}"))
+            self.logger.info("Processing star %d/%d: %s", count, len(orderedIndices), starName)
+
+            df.at[idx, "bestMatch"] = None
+            df.at[idx, "provenance"] = None
+            df.at[idx, "lightCurvePath"] = None
+            df.at[idx, "extractionMetadata"] = None
+            df.at[idx, "lightCurveAvailable"] = False
+            df.at[idx, "noLightCurveReason"] = None
+
+            ticCandidates = self._sortedTicCandidates(row.get("ticCandidates"))
+            matchedResult = None
+
+            for candidate in ticCandidates:
+                ticId = self._normalizeTicId(candidate.get("ticId"))
                 if ticId is None:
                     continue
 
-                lightCurve = self.downloadTessLightCurve(
-                    ticId=ticId,
-                    author=author,
-                    exptime=exptime,
-                    sector=sector,
-                    fluxColumn=fluxColumn,
-                    stitch=stitch,
+                for author in ("SPOC", "QLP"):
+                    matchedResult = self._downloadCatalogLightCurve(ticId, author)
+                    if matchedResult is None:
+                        continue
+
+                    matchedResult["bestMatch"]["ticDistanceArcmin"] = candidate.get("ticDistanceArcmin")
+                    matchedResult["bestMatch"]["ticRaDeg"] = candidate.get("ticRaDeg")
+                    matchedResult["bestMatch"]["ticDecDeg"] = candidate.get("ticDecDeg")
+                    matchedResult["bestMatch"]["ticTmag"] = candidate.get("ticTmag")
+                    matchedResult["extractionMetadata"]["selectedCandidate"] = dict(candidate)
+                    break
+
+                if matchedResult is not None:
+                    break
+
+            if matchedResult is None:
+                matchedResult = self._extractTessCutLightCurve(row.to_dict(), ticCandidates, cutoutSize)
+
+            if matchedResult is None:
+                df.at[idx, "noLightCurveReason"] = (
+                    "No SPOC/QLP light curve and no usable TESSCut extraction"
                 )
+                continue
 
-                if lightCurve is None:
-                    continue
+            df.at[idx, "bestMatch"] = matchedResult["bestMatch"]
+            df.at[idx, "provenance"] = matchedResult["provenance"]
+            df.at[idx, "lightCurvePath"] = matchedResult["lightCurvePath"]
+            df.at[idx, "extractionMetadata"] = matchedResult["extractionMetadata"]
+            df.at[idx, "lightCurveAvailable"] = matchedResult["lightCurveAvailable"]
 
-                if preprocess:
-                    lightCurve = self.preprocessLightCurve(lightCurve, **preprocessConfig)
-
-                if lightCurve is None:
-                    continue
-
-                enrichedStar = dict(star)
-                enrichedStar["lightCurve"] = lightCurve
-                enrichedStars.append(enrichedStar)
-
-            result[family] = enrichedStars
-
-        return result
+        augmentedPath = os.path.join(self.tessCacheFolder, augmentedMetadataFile)
+        df.to_parquet(augmentedPath, index=False)
+        self.logger.info("Saved augmented metadata to %s", augmentedPath)
+        return df
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
