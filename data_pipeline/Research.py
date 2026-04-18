@@ -147,7 +147,7 @@ if __name__ == "__main__":
     vsxLoader = VSXCategoryLoader(refreshCache=reload)
     tessConverter = VSX2TESSConverter()
 
-    pipeline = ResearchPipeline(vsxLoader, tessConverter)
+    pipeline = ResearchPipeline(vsxLoader, tessConverter, nFamilies = 5, nInstances=5)
     tessMetadata = pipeline.loadCandidates()
     print("TESS Metadata loaded for %d variable star candidates across %d families" % (sum(len(stars) for stars in tessMetadata.values()), len(tessMetadata)))
     stat, total = pipeline.countBestMatchesByFamily(pipeline.tessCacheFolder + os.path.sep + "VSXMetadata.parquet")
@@ -155,6 +155,7 @@ if __name__ == "__main__":
         print(f"Family {family}: {count} stars with bestMatch, out of {len(tessMetadata.get(family, []))} total stars in family")
     print(f"Total stars with bestMatch: {total} out of {sum(len(stars) for stars in tessMetadata.values())} candidates")
     tessDataloader = TessDataDownloader()
+    augmented = tessDataloader.downloadTessLightCurves("VSXMetadata.parquet")
     # lcurves = tessDataloader.dlSample(tmpticDict, refresh=True)
     # lcurves
     # tessDataloader = TessDataDownloader()

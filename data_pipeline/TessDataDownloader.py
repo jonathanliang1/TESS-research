@@ -2,13 +2,56 @@ import pandas as pd
 import lightkurve as lk
 import logging
 import os
+import re
 import sys
 import time
 import shutil
+import io
 import numpy as np
+import warnings
 from astropy.coordinates import SkyCoord
 from astropy import units as u
+from astropy.io import fits
+from contextlib import redirect_stderr, redirect_stdout
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+class _QualityMaskLogFilter(logging.Filter):
+    """
+    Drops quality-mask log records emitted by Lightkurve below a given
+    ignored-cadence percentage threshold, and updates downloader quality.
+    """
+    _PATTERN = re.compile(
+        r"([0-9]+(?:\.[0-9]+)?)%.*cadences will be ignored due to the quality mask",
+        re.IGNORECASE,
+    )
+
+    def __init__(self, thresholdPercent=20.0, downloader=None):
+        super().__init__()
+        self.thresholdPercent = thresholdPercent
+        self.downloader = downloader
+
+    def filter(self, record):
+        message = record.getMessage()
+        match = self._PATTERN.search(message)
+        if match is not None:
+            percentage = float(match.group(1))
+            if self.downloader is not None:
+                self.downloader._updateStarQuality(percentage)
+            return percentage > self.thresholdPercent
+        return True
+
+
+_qualityMaskLogFilter = _QualityMaskLogFilter(thresholdPercent=20.0, downloader=None)
+for _lkLoggerName in (
+    "lightkurve",
+    "lightkurve.io",
+    "lightkurve.lightcurve",
+    "lightkurve.utils",
+    "lightkurve.search",
+    "lightkurve.targetpixelfile",
+):
+    logging.getLogger(_lkLoggerName).addFilter(_qualityMaskLogFilter)
 
 class TessDataDownloader:
     """
@@ -19,8 +62,16 @@ class TessDataDownloader:
         """Initialize the TessDataDownloader."""
         self.logger = logging.getLogger("TessDataDownloader")
         self.tessCacheFolder = tessCacheFolder
+        self.normalizationStdFloor = 1e-8
+        self.lowSnrThreshold = 3.0
         if not os.path.exists(self.tessCacheFolder):
             os.makedirs(self.tessCacheFolder)
+
+        self.ignoredCadenceWarningThresholdPercent = 20.0
+        self.currentStarQuality = "missing"
+        
+        global _qualityMaskLogFilter
+        _qualityMaskLogFilter.downloader = self
 
     def preprocessLightCurve(
         self,
@@ -44,13 +95,16 @@ class TessDataDownloader:
             return None
 
         processed = lightCurve
+        normalizationMetadata = None
 
         try:
             if doRemoveNans:
                 processed = processed.remove_nans()
 
             if doNormalize:
-                processed = processed.normalize()
+                processed, normalizationMetadata = self._standardizeLightCurve(processed)
+                if processed is None:
+                    return None
 
             if doFlatten:
                 processed = processed.flatten(window_length=flattenWindowLength)
@@ -79,6 +133,25 @@ class TessDataDownloader:
             return cachePath
 
         return tessMetadataParquet
+
+    def _cleanupTransientDownloads(self):
+        transientPaths = [
+            os.path.join(self.tessCacheFolder, "mastDownload"),
+            os.path.join(self.tessCacheFolder, "tesscut"),
+        ]
+
+        for transientPath in transientPaths:
+            if not os.path.exists(transientPath):
+                continue
+
+            try:
+                shutil.rmtree(transientPath)
+            except Exception as exc:
+                self.logger.warning(
+                    "Failed to remove transient download directory %s: %s",
+                    transientPath,
+                    exc,
+                )
 
     def _normalizeTicId(self, value):
         if value is None:
@@ -120,14 +193,224 @@ class TessDataDownloader:
         )
         return normalizedCandidates
 
-    def _lightCurveFromSearchResult(self, searchResult):
+    def _standardizeLightCurve(self, lightCurve):
+        if lightCurve is None:
+            return None, None
+
+        cleanedLightCurve = lightCurve.remove_nans()
+        if len(cleanedLightCurve) == 0:
+            return None, {
+                "normalizationApplied": False,
+                "fluxMedian": None,
+                "fluxStd": None,
+                "fluxSnr": None,
+                "medianUnstable": True,
+                "lowSNR": True,
+                "lowQualityLightCurve": True,
+                "lowQualityReason": "No valid cadences after removing NaNs",
+                "validCadenceCount": 0,
+            }
+
+        fluxArray = np.asarray(getattr(cleanedLightCurve.flux, "value", cleanedLightCurve.flux), dtype=float)
+        validMask = np.isfinite(fluxArray)
+
+        fluxMask = getattr(cleanedLightCurve.flux, "mask", None)
+        if fluxMask is not None:
+            fluxMaskArray = np.asarray(fluxMask, dtype=bool)
+            if fluxMaskArray.shape == ():
+                validMask &= (not bool(fluxMaskArray))
+            else:
+                validMask &= np.logical_not(fluxMaskArray)
+
+        if hasattr(cleanedLightCurve.time, "value"):
+            timeValues = np.asarray(cleanedLightCurve.time.value, dtype=float)
+            validMask &= np.isfinite(timeValues)
+
+        validFlux = fluxArray[validMask]
+        if validFlux.size == 0:
+            return None, {
+                "normalizationApplied": False,
+                "fluxMedian": None,
+                "fluxStd": None,
+                "fluxSnr": None,
+                "medianUnstable": True,
+                "lowSNR": True,
+                "lowQualityLightCurve": True,
+                "lowQualityReason": "No valid cadences after masking invalid flux values",
+                "validCadenceCount": 0,
+            }
+
+        medianFlux = float(np.nanmedian(validFlux))
+        stdFlux = float(np.nanstd(validFlux))
+        medianUnstable = (not np.isfinite(medianFlux)) or abs(medianFlux) < self.normalizationStdFloor
+        lowStd = (not np.isfinite(stdFlux)) or stdFlux < self.normalizationStdFloor
+        fluxSnr = None if lowStd else float(abs(medianFlux) / stdFlux)
+        lowSNR = fluxSnr is None or fluxSnr < self.lowSnrThreshold
+
+        normalizationMetadata = {
+            "normalizationApplied": False,
+            "fluxMedian": medianFlux,
+            "fluxStd": stdFlux,
+            "fluxSnr": fluxSnr,
+            "medianUnstable": bool(medianUnstable),
+            "lowSNR": bool(lowSNR),
+            "lowQualityLightCurve": bool(medianUnstable or lowSNR or lowStd),
+            "lowQualityReason": None,
+            "validCadenceCount": int(validFlux.size),
+        }
+
+        if lowStd:
+            normalizationMetadata["lowQualityReason"] = "Flux standard deviation is too small for stable normalization"
+            return cleanedLightCurve, normalizationMetadata
+
+        standardizedFlux = np.full_like(fluxArray, np.nan, dtype=float)
+        standardizedFlux[validMask] = (fluxArray[validMask] - medianFlux) / stdFlux
+
+        standardizedLightCurve = cleanedLightCurve.copy()
+        standardizedLightCurve.flux = standardizedFlux * u.dimensionless_unscaled
+
+        if hasattr(standardizedLightCurve, "flux_err") and standardizedLightCurve.flux_err is not None:
+            fluxErrArray = np.asarray(
+                getattr(standardizedLightCurve.flux_err, "value", standardizedLightCurve.flux_err),
+                dtype=float,
+            )
+            standardizedFluxErr = np.full_like(fluxErrArray, np.nan, dtype=float)
+            finiteFluxErr = np.isfinite(fluxErrArray)
+            standardizedFluxErr[finiteFluxErr] = fluxErrArray[finiteFluxErr] / stdFlux
+            standardizedLightCurve.flux_err = standardizedFluxErr * u.dimensionless_unscaled
+
+        normalizationMetadata["normalizationApplied"] = True
+        return standardizedLightCurve.remove_nans(), normalizationMetadata
+
+    def _storeLightCurve(self, lightCurve, outputFile, ticId, authorLabel):
+        try:
+            lightCurve.to_fits(path=outputFile, overwrite=True)
+        except (AttributeError, ValueError) as exc:
+            self.logger.warning(
+                "to_fits failed for TIC %s author %s, using fallback: %s",
+                ticId,
+                authorLabel,
+                exc,
+            )
+            try:
+                timeCol = fits.Column(name="TIME", format="D", array=lightCurve.time.jd)
+                fluxCol = fits.Column(name="FLUX", format="E", array=np.asarray(lightCurve.flux.value, dtype=float))
+                cols = fits.ColDefs([timeCol, fluxCol])
+                hdu = fits.BinTableHDU.from_columns(cols)
+                hdu.writeto(outputFile, overwrite=True)
+            except Exception as fallbackExc:
+                self.logger.error(
+                    "Fallback FITS write also failed for TIC %s author %s: %s",
+                    ticId,
+                    authorLabel,
+                    fallbackExc,
+                )
+                return False
+
+        return True
+
+    def _categorizeQualityMaskPercentage(self, percentage):
+        """Categorize data quality based on quality_bitmask cadence percentage."""
+        if percentage < 10:
+            return "clean"
+        elif percentage < 25:
+            return "acceptable"
+        elif percentage < 40:
+            return "caution"
+        else:
+            return "poor"
+
+    def _updateStarQuality(self, percentage):
+        """Update current star quality to worst quality seen so far."""
+        newQuality = self._categorizeQualityMaskPercentage(percentage)
+        qualityOrder = {"clean": 0, "acceptable": 1, "caution": 2, "poor": 3}
+        if qualityOrder.get(newQuality, 0) > qualityOrder.get(self.currentStarQuality, 0):
+            self.currentStarQuality = newQuality
+
+    def _finalizeStarQuality(self, lightCurveAvailable):
+        """Return final quality after considering whether any light curve was available."""
+        if not lightCurveAvailable:
+            return "missing"
+
+        if self.currentStarQuality == "missing":
+            return "clean"
+
+        return self.currentStarQuality
+
+    def _runWithFilteredWarnings(self, func, *args, ticId=None, warningContext=None, **kwargs):
+        qualityWarningPattern = re.compile(
+            r"([0-9]+(?:\.[0-9]+)?)%\s*\([^)]*\)\s*of the cadences will be ignored due to the quality mask",
+            re.IGNORECASE,
+        )
+        negativeMedianPattern = re.compile(
+            r"negative median flux",
+            re.IGNORECASE,
+        )
+        zeroCenteredPattern = re.compile(
+            r"zero-centered.*normalize\(\)",
+            re.IGNORECASE,
+        )
+        boolInversionDeprecationPattern = re.compile(
+            r"bitwise inversion\s+['`~]+\s*on bool\s+is deprecated",
+            re.IGNORECASE,
+        )
+
+        with warnings.catch_warnings(record=True) as caughtWarnings:
+            warnings.simplefilter("always")
+            result = func(*args, **kwargs)
+
+        for caughtWarning in caughtWarnings:
+            warningMessage = str(caughtWarning.message)
+            qualityMatch = qualityWarningPattern.search(warningMessage)
+
+            if qualityMatch is not None:
+                ignoredPercent = float(qualityMatch.group(1))
+                self._updateStarQuality(ignoredPercent)
+                if ignoredPercent > self.ignoredCadenceWarningThresholdPercent:
+                    self.logger.warning(
+                        "High quality-mask rejection for TIC %s%s: %s",
+                        ticId if ticId is not None else "unknown",
+                        f" during {warningContext}" if warningContext else "",
+                        warningMessage,
+                    )
+                continue
+
+            if negativeMedianPattern.search(warningMessage) is not None:
+                continue
+
+            if zeroCenteredPattern.search(warningMessage) is not None:
+                continue
+
+            if boolInversionDeprecationPattern.search(warningMessage) is not None:
+                continue
+
+            self.logger.warning(
+                "Warning for TIC %s%s: %s",
+                ticId if ticId is not None else "unknown",
+                f" during {warningContext}" if warningContext else "",
+                warningMessage,
+            )
+
+        return result
+
+    def _lightCurveFromSearchResult(self, searchResult, ticId=None):
         if searchResult is None or len(searchResult) == 0:
             return None
 
         try:
-            downloaded = searchResult.download_all(download_dir=self.tessCacheFolder)
+            downloaded = self._runWithFilteredWarnings(
+                searchResult.download_all,
+                download_dir=self.tessCacheFolder,
+                ticId=ticId,
+                warningContext="search_lightcurve download_all",
+            )
         except Exception:
-            downloaded = searchResult.download(download_dir=self.tessCacheFolder)
+            downloaded = self._runWithFilteredWarnings(
+                searchResult.download,
+                download_dir=self.tessCacheFolder,
+                ticId=ticId,
+                warningContext="search_lightcurve download",
+            )
 
         if downloaded is None:
             return None
@@ -143,9 +426,31 @@ class TessDataDownloader:
 
         return downloaded
 
+    def _runQuietLightkurveSearch(self, searchFn, *args, **kwargs):
+        loggerNames = [
+            "lightkurve.search",
+            "astroquery",
+            "astroquery.mast",
+        ]
+        loggerState = []
+
+        for loggerName in loggerNames:
+            packageLogger = logging.getLogger(loggerName)
+            loggerState.append((packageLogger, packageLogger.level, packageLogger.disabled))
+            packageLogger.setLevel(logging.CRITICAL + 1)
+
+        try:
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                return searchFn(*args, **kwargs)
+        finally:
+            for packageLogger, level, disabled in loggerState:
+                packageLogger.setLevel(level)
+                packageLogger.disabled = disabled
+
     def _downloadCatalogLightCurve(self, ticId, author):
         try:
-            searchResult = lk.search_lightcurve(
+            searchResult = self._runQuietLightkurveSearch(
+                lk.search_lightcurve,
                 f"TIC {ticId}",
                 mission="TESS",
                 author=author,
@@ -162,12 +467,20 @@ class TessDataDownloader:
         if searchResult is None or len(searchResult) == 0:
             return None
 
-        lightCurve = self._lightCurveFromSearchResult(searchResult)
+        lightCurve = self._lightCurveFromSearchResult(
+            searchResult,
+            ticId=ticId,
+        )
         if lightCurve is None:
             return None
 
+        standardizedLightCurve, normalizationMetadata = self._standardizeLightCurve(lightCurve)
+        if standardizedLightCurve is None:
+            return None
+
         outputFile = os.path.join(self.tessCacheFolder, f"TIC_{ticId}_{author}.fits")
-        lightCurve.to_fits(path=outputFile, overwrite=True)
+        if not self._storeLightCurve(standardizedLightCurve, outputFile, ticId, author):
+            return None
 
         sectors = []
         if hasattr(searchResult, "table") and "sequence_number" in searchResult.table.colnames:
@@ -187,7 +500,16 @@ class TessDataDownloader:
                 "author": author,
                 "productCount": int(len(searchResult)),
                 "sectors": sectors,
+                "fluxNormalization": normalizationMetadata,
             },
+            "normalizationApplied": normalizationMetadata["normalizationApplied"],
+            "fluxMedian": normalizationMetadata["fluxMedian"],
+            "fluxStd": normalizationMetadata["fluxStd"],
+            "fluxSnr": normalizationMetadata["fluxSnr"],
+            "medianUnstable": normalizationMetadata["medianUnstable"],
+            "lowSNR": normalizationMetadata["lowSNR"],
+            "lowQualityLightCurve": normalizationMetadata["lowQualityLightCurve"],
+            "lowQualityReason": normalizationMetadata["lowQualityReason"],
         }
 
     def _extractTessCutLightCurve(self, starRecord, ticCandidates, cutoutSize):
@@ -207,7 +529,7 @@ class TessDataDownloader:
             return None
 
         try:
-            searchResult = lk.search_tesscut(coord)
+            searchResult = self._runQuietLightkurveSearch(lk.search_tesscut, coord)
         except Exception as exc:
             self.logger.warning(
                 "search_tesscut failed for %s: %s",
@@ -220,9 +542,12 @@ class TessDataDownloader:
             return None
 
         try:
-            tpfCollection = searchResult.download_all(
+            tpfCollection = self._runWithFilteredWarnings(
+                searchResult.download_all,
                 cutout_size=cutoutSize,
                 download_dir=self.tessCacheFolder,
+                ticId=self._normalizeTicId((ticCandidates[0] if ticCandidates else {}).get("ticId")),
+                warningContext="search_tesscut download_all",
             )
         except Exception as exc:
             self.logger.warning(
@@ -246,7 +571,12 @@ class TessDataDownloader:
                     apertureMask = np.zeros(tpf.flux[0].shape, dtype=bool)
                     apertureMask[apertureMask.shape[0] // 2, apertureMask.shape[1] // 2] = True
 
-                lightCurve = tpf.to_lightcurve(aperture_mask=apertureMask).remove_nans()
+                lightCurve = self._runWithFilteredWarnings(
+                    tpf.to_lightcurve,
+                    aperture_mask=apertureMask,
+                    ticId=self._normalizeTicId((ticCandidates[0] if ticCandidates else {}).get("ticId")),
+                    warningContext="TESSCut to_lightcurve",
+                ).remove_nans()
                 if len(lightCurve) == 0:
                     continue
 
@@ -262,6 +592,14 @@ class TessDataDownloader:
                     starRecord.get("VSXName", starRecord.get("VSXId", "unknown")),
                     exc,
                 )
+            finally:
+                try:
+                    if hasattr(tpf, "close") and callable(tpf.close):
+                        tpf.close()
+                    elif hasattr(tpf, "hdu") and hasattr(tpf.hdu, "close"):
+                        tpf.hdu.close()
+                except Exception as closeExc:
+                    self.logger.debug("Failed to close TESSCut handle cleanly: %s", closeExc)
 
         if not extractedCurves:
             return None
@@ -279,11 +617,16 @@ class TessDataDownloader:
         if len(stitched) == 0:
             return None
 
+        standardizedLightCurve, normalizationMetadata = self._standardizeLightCurve(stitched)
+        if standardizedLightCurve is None:
+            return None
+
         preferredCandidate = ticCandidates[0] if ticCandidates else {}
         chosenTicId = self._normalizeTicId(preferredCandidate.get("ticId")) or "NA"
 
         outputFile = os.path.join(self.tessCacheFolder, f"TIC_{chosenTicId}_TESSCut.fits")
-        stitched.to_fits(path=outputFile, overwrite=True)
+        if not self._storeLightCurve(standardizedLightCurve, outputFile, chosenTicId, "TESSCut"):
+            return None
 
         return {
             "bestMatch": {"ticId": chosenTicId, "author": "TESSCut"},
@@ -301,7 +644,16 @@ class TessDataDownloader:
                 "selectedCandidateTicId": chosenTicId,
                 "selectedCandidateDistanceArcmin": preferredCandidate.get("ticDistanceArcmin"),
                 "extractionMethod": "threshold_mask_photometry",
+                "fluxNormalization": normalizationMetadata,
             },
+            "normalizationApplied": normalizationMetadata["normalizationApplied"],
+            "fluxMedian": normalizationMetadata["fluxMedian"],
+            "fluxStd": normalizationMetadata["fluxStd"],
+            "fluxSnr": normalizationMetadata["fluxSnr"],
+            "medianUnstable": normalizationMetadata["medianUnstable"],
+            "lowSNR": normalizationMetadata["lowSNR"],
+            "lowQualityLightCurve": normalizationMetadata["lowQualityLightCurve"],
+            "lowQualityReason": normalizationMetadata["lowQualityReason"],
         }
 
     def downloadTessLightCurves(
@@ -309,6 +661,8 @@ class TessDataDownloader:
         tessMetadataParquet,
         augmentedMetadataFile="TESSAugmented.parquet",
         cutoutSize=(15, 15),
+        cleanupDownloads=True,
+        lowSnrThreshold=None,
     ):
         """
         Download or extract TESS light curves for each star in cached metadata.
@@ -317,6 +671,10 @@ class TessDataDownloader:
         SPOC then QLP products. If neither exists, it falls back to TESSCut using
         the original VSX coordinates and writes augmented metadata to parquet.
         """
+        originalLowSnrThreshold = self.lowSnrThreshold
+        if lowSnrThreshold is not None:
+            self.lowSnrThreshold = float(lowSnrThreshold)
+
         metadataPath = self._resolveMetadataPath(tessMetadataParquet)
         df = pd.read_parquet(metadataPath)
 
@@ -334,6 +692,15 @@ class TessDataDownloader:
             "extractionMetadata",
             "lightCurveAvailable",
             "noLightCurveReason",
+            "normalizationApplied",
+            "fluxMedian",
+            "fluxStd",
+            "fluxSnr",
+            "medianUnstable",
+            "lowSNR",
+            "lowQualityLightCurve",
+            "lowQualityReason",
+            "quality",
         ]:
             if column not in df.columns:
                 df[column] = [None] * len(df)
@@ -341,60 +708,104 @@ class TessDataDownloader:
         orderedIndices = df.sort_values(["family", "VSXName"], na_position="last").index.tolist()
         currentFamily = None
 
-        for count, idx in enumerate(orderedIndices, start=1):
-            row = df.loc[idx]
-            family = row.get("family")
-            if family != currentFamily:
-                currentFamily = family
-                self.logger.info("Processing family %s", family)
+        try:
+            for count, idx in enumerate(orderedIndices, start=1):
+                row = df.loc[idx]
+                family = row.get("family")
+                if family != currentFamily:
+                    currentFamily = family
+                    self.logger.info("Processing family %s", family)
 
-            starName = row.get("VSXName", row.get("VSXId", f"row-{idx}"))
-            self.logger.info("Processing star %d/%d: %s", count, len(orderedIndices), starName)
+                starName = row.get("VSXName", row.get("VSXId", f"row-{idx}"))
+                self.logger.info("Processing star %d/%d: %s", count, len(orderedIndices), starName)
 
-            df.at[idx, "bestMatch"] = None
-            df.at[idx, "provenance"] = None
-            df.at[idx, "lightCurvePath"] = None
-            df.at[idx, "extractionMetadata"] = None
-            df.at[idx, "lightCurveAvailable"] = False
-            df.at[idx, "noLightCurveReason"] = None
+                self.currentStarQuality = "missing"
 
-            ticCandidates = self._sortedTicCandidates(row.get("ticCandidates"))
-            matchedResult = None
+                df.at[idx, "bestMatch"] = None
+                df.at[idx, "provenance"] = None
+                df.at[idx, "lightCurvePath"] = None
+                df.at[idx, "extractionMetadata"] = None
+                df.at[idx, "lightCurveAvailable"] = False
+                df.at[idx, "noLightCurveReason"] = None
+                df.at[idx, "normalizationApplied"] = None
+                df.at[idx, "fluxMedian"] = None
+                df.at[idx, "fluxStd"] = None
+                df.at[idx, "fluxSnr"] = None
+                df.at[idx, "medianUnstable"] = None
+                df.at[idx, "lowSNR"] = None
+                df.at[idx, "lowQualityLightCurve"] = None
+                df.at[idx, "lowQualityReason"] = None
+                df.at[idx, "quality"] = "missing"
 
-            for candidate in ticCandidates:
-                ticId = self._normalizeTicId(candidate.get("ticId"))
-                if ticId is None:
-                    continue
+                ticCandidates = self._sortedTicCandidates(row.get("ticCandidates"))
+                preferredTicId = self._normalizeTicId(
+                    (ticCandidates[0] if ticCandidates else {}).get("ticId")
+                )
+                matchedResult = None
 
-                for author in ("SPOC", "QLP"):
-                    matchedResult = self._downloadCatalogLightCurve(ticId, author)
+                try:
+                    def _processStar():
+                        nonlocal matchedResult
+
+                        for candidate in ticCandidates:
+                            ticId = self._normalizeTicId(candidate.get("ticId"))
+                            if ticId is None:
+                                continue
+
+                            for author in ("SPOC", "QLP"):
+                                matchedResult = self._downloadCatalogLightCurve(ticId, author)
+                                if matchedResult is None:
+                                    continue
+
+                                matchedResult["bestMatch"]["ticDistanceArcmin"] = candidate.get("ticDistanceArcmin")
+                                matchedResult["bestMatch"]["ticRaDeg"] = candidate.get("ticRaDeg")
+                                matchedResult["bestMatch"]["ticDecDeg"] = candidate.get("ticDecDeg")
+                                matchedResult["bestMatch"]["ticTmag"] = candidate.get("ticTmag")
+                                matchedResult["extractionMetadata"]["selectedCandidate"] = dict(candidate)
+                                return
+
+                        matchedResult = self._extractTessCutLightCurve(row.to_dict(), ticCandidates, cutoutSize)
+
+                    self._runWithFilteredWarnings(
+                        _processStar,
+                        ticId=preferredTicId,
+                        warningContext="star processing",
+                    )
+
                     if matchedResult is None:
+                        self.logger.error(
+                            "No usable TESS light curve found for %s after SPOC, QLP, and TESSCut attempts",
+                            starName,
+                        )
+                        df.at[idx, "noLightCurveReason"] = (
+                            "No SPOC/QLP light curve and no usable TESSCut extraction"
+                        )
+                        df.at[idx, "quality"] = self._finalizeStarQuality(False)
                         continue
 
-                    matchedResult["bestMatch"]["ticDistanceArcmin"] = candidate.get("ticDistanceArcmin")
-                    matchedResult["bestMatch"]["ticRaDeg"] = candidate.get("ticRaDeg")
-                    matchedResult["bestMatch"]["ticDecDeg"] = candidate.get("ticDecDeg")
-                    matchedResult["bestMatch"]["ticTmag"] = candidate.get("ticTmag")
-                    matchedResult["extractionMetadata"]["selectedCandidate"] = dict(candidate)
-                    break
-
-                if matchedResult is not None:
-                    break
-
-            if matchedResult is None:
-                matchedResult = self._extractTessCutLightCurve(row.to_dict(), ticCandidates, cutoutSize)
-
-            if matchedResult is None:
-                df.at[idx, "noLightCurveReason"] = (
-                    "No SPOC/QLP light curve and no usable TESSCut extraction"
-                )
-                continue
-
-            df.at[idx, "bestMatch"] = matchedResult["bestMatch"]
-            df.at[idx, "provenance"] = matchedResult["provenance"]
-            df.at[idx, "lightCurvePath"] = matchedResult["lightCurvePath"]
-            df.at[idx, "extractionMetadata"] = matchedResult["extractionMetadata"]
-            df.at[idx, "lightCurveAvailable"] = matchedResult["lightCurveAvailable"]
+                    df.at[idx, "bestMatch"] = matchedResult["bestMatch"]
+                    df.at[idx, "provenance"] = matchedResult["provenance"]
+                    df.at[idx, "lightCurvePath"] = matchedResult["lightCurvePath"]
+                    df.at[idx, "extractionMetadata"] = matchedResult["extractionMetadata"]
+                    df.at[idx, "lightCurveAvailable"] = matchedResult["lightCurveAvailable"]
+                    df.at[idx, "normalizationApplied"] = matchedResult.get("normalizationApplied")
+                    df.at[idx, "fluxMedian"] = matchedResult.get("fluxMedian")
+                    df.at[idx, "fluxStd"] = matchedResult.get("fluxStd")
+                    df.at[idx, "fluxSnr"] = matchedResult.get("fluxSnr")
+                    df.at[idx, "medianUnstable"] = matchedResult.get("medianUnstable")
+                    df.at[idx, "lowSNR"] = matchedResult.get("lowSNR")
+                    df.at[idx, "lowQualityLightCurve"] = matchedResult.get("lowQualityLightCurve")
+                    df.at[idx, "lowQualityReason"] = matchedResult.get("lowQualityReason")
+                    df.at[idx, "quality"] = self._finalizeStarQuality(
+                        matchedResult.get("lightCurveAvailable", False)
+                    )
+                finally:
+                    if cleanupDownloads:
+                        self._cleanupTransientDownloads()
+        finally:
+            self.lowSnrThreshold = originalLowSnrThreshold
+            if cleanupDownloads:
+                self._cleanupTransientDownloads()
 
         augmentedPath = os.path.join(self.tessCacheFolder, augmentedMetadataFile)
         df.to_parquet(augmentedPath, index=False)

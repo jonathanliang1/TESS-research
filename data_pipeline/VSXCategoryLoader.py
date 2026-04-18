@@ -16,6 +16,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from astropy.io.votable import parse_single_table
 import lightkurve as lk
+import warnings
 
 class VSXCategoryLoader:
     def __init__(self, cacheFolder='VSXCache', refreshCache=False):
