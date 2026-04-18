@@ -8,6 +8,7 @@ import time
 import shutil
 import io
 import numpy as np
+import threading
 import warnings
 from astropy.coordinates import SkyCoord
 from astropy import units as u
@@ -68,7 +69,8 @@ class TessDataDownloader:
             os.makedirs(self.tessCacheFolder)
 
         self.ignoredCadenceWarningThresholdPercent = 20.0
-        self.currentStarQuality = "missing"
+        self._threadState = threading.local()
+        self._workerDownloadsRoot = os.path.join(self.tessCacheFolder, "_worker_downloads")
         
         global _qualityMaskLogFilter
         _qualityMaskLogFilter.downloader = self
@@ -134,10 +136,11 @@ class TessDataDownloader:
 
         return tessMetadataParquet
 
-    def _cleanupTransientDownloads(self):
+    def _cleanupTransientDownloads(self, downloadRoot=None):
+        rootPath = downloadRoot or self.tessCacheFolder
         transientPaths = [
-            os.path.join(self.tessCacheFolder, "mastDownload"),
-            os.path.join(self.tessCacheFolder, "tesscut"),
+            os.path.join(rootPath, "mastDownload"),
+            os.path.join(rootPath, "tesscut"),
         ]
 
         for transientPath in transientPaths:
@@ -152,6 +155,12 @@ class TessDataDownloader:
                     transientPath,
                     exc,
                 )
+
+    def _resetStarQuality(self):
+        self._threadState.currentStarQuality = "missing"
+
+    def _getCurrentStarQuality(self):
+        return getattr(self._threadState, "currentStarQuality", "missing")
 
     def _normalizeTicId(self, value):
         if value is None:
@@ -192,6 +201,48 @@ class TessDataDownloader:
             key=lambda candidate: float(candidate.get("ticDistanceArcmin", float("inf")))
         )
         return normalizedCandidates
+
+    def _logDuplicateTicMappings(self, df):
+        """Log stars that map to the same top TIC candidate."""
+        starsByTopTic = {}
+        duplicateWarningCount = 0
+
+        for _, row in df.iterrows():
+            ticCandidates = self._sortedTicCandidates(row.get("ticCandidates"))
+            topTic = self._normalizeTicId((ticCandidates[0] if ticCandidates else {}).get("ticId"))
+            if topTic is None:
+                continue
+
+            candidateTics = [
+                self._normalizeTicId(candidate.get("ticId"))
+                for candidate in ticCandidates
+            ]
+            candidateTics = [tic for tic in candidateTics if tic is not None]
+
+            starsByTopTic.setdefault(topTic, []).append(
+                {
+                    "family": row.get("family"),
+                    "VSXType": row.get("VSXType"),
+                    "VSXId": row.get("VSXId"),
+                    "tics": candidateTics,
+                }
+            )
+
+        for topTic, stars in starsByTopTic.items():
+            if len(stars) < 2:
+                continue
+            for star in stars:
+                self.logger.error(
+                    "Duplicate TIC mapping detected: TIC=%s family=%s vsxtype=%s vsxid=%s tics=%s",
+                    topTic,
+                    star.get("family"),
+                    star.get("VSXType"),
+                    star.get("VSXId"),
+                    star.get("tics"),
+                )
+                duplicateWarningCount += 1
+
+        return duplicateWarningCount
 
     def _standardizeLightCurve(self, lightCurve):
         if lightCurve is None:
@@ -324,18 +375,19 @@ class TessDataDownloader:
         """Update current star quality to worst quality seen so far."""
         newQuality = self._categorizeQualityMaskPercentage(percentage)
         qualityOrder = {"clean": 0, "acceptable": 1, "caution": 2, "poor": 3}
-        if qualityOrder.get(newQuality, 0) > qualityOrder.get(self.currentStarQuality, 0):
-            self.currentStarQuality = newQuality
+        currentQuality = self._getCurrentStarQuality()
+        if qualityOrder.get(newQuality, 0) > qualityOrder.get(currentQuality, 0):
+            self._threadState.currentStarQuality = newQuality
 
     def _finalizeStarQuality(self, lightCurveAvailable):
         """Return final quality after considering whether any light curve was available."""
         if not lightCurveAvailable:
             return "missing"
 
-        if self.currentStarQuality == "missing":
+        if self._getCurrentStarQuality() == "missing":
             return "clean"
 
-        return self.currentStarQuality
+        return self._getCurrentStarQuality()
 
     def _runWithFilteredWarnings(self, func, *args, ticId=None, warningContext=None, **kwargs):
         qualityWarningPattern = re.compile(
@@ -393,21 +445,23 @@ class TessDataDownloader:
 
         return result
 
-    def _lightCurveFromSearchResult(self, searchResult, ticId=None):
+    def _lightCurveFromSearchResult(self, searchResult, ticId=None, downloadDir=None):
         if searchResult is None or len(searchResult) == 0:
             return None
+
+        resolvedDownloadDir = downloadDir or self.tessCacheFolder
 
         try:
             downloaded = self._runWithFilteredWarnings(
                 searchResult.download_all,
-                download_dir=self.tessCacheFolder,
+                download_dir=resolvedDownloadDir,
                 ticId=ticId,
                 warningContext="search_lightcurve download_all",
             )
         except Exception:
             downloaded = self._runWithFilteredWarnings(
                 searchResult.download,
-                download_dir=self.tessCacheFolder,
+                download_dir=resolvedDownloadDir,
                 ticId=ticId,
                 warningContext="search_lightcurve download",
             )
@@ -447,7 +501,7 @@ class TessDataDownloader:
                 packageLogger.setLevel(level)
                 packageLogger.disabled = disabled
 
-    def _downloadCatalogLightCurve(self, ticId, author):
+    def _downloadCatalogLightCurve(self, ticId, author, downloadDir=None):
         try:
             searchResult = self._runQuietLightkurveSearch(
                 lk.search_lightcurve,
@@ -470,6 +524,7 @@ class TessDataDownloader:
         lightCurve = self._lightCurveFromSearchResult(
             searchResult,
             ticId=ticId,
+            downloadDir=downloadDir,
         )
         if lightCurve is None:
             return None
@@ -512,14 +567,25 @@ class TessDataDownloader:
             "lowQualityReason": normalizationMetadata["lowQualityReason"],
         }
 
-    def _extractTessCutLightCurve(self, starRecord, ticCandidates, cutoutSize):
-        raDeg = starRecord.get("raDeg")
-        decDeg = starRecord.get("decDeg")
-        if raDeg is None or decDeg is None:
+    def _extractTessCutLightCurve(self, starRecord, ticCandidates, cutoutSize, downloadDir=None):
+        preferredCandidate = ticCandidates[0] if ticCandidates else {}
+
+        # Prefer the selected TIC candidate position for TESSCut centering.
+        sourceRaDeg = preferredCandidate.get("ticRaDeg")
+        sourceDecDeg = preferredCandidate.get("ticDecDeg")
+
+        # Fall back to original VSX coordinates if candidate coordinates are missing.
+        if sourceRaDeg is None or sourceDecDeg is None:
+            sourceRaDeg = starRecord.get("raDeg")
+            sourceDecDeg = starRecord.get("decDeg")
+
+        if sourceRaDeg is None or sourceDecDeg is None:
             return None
 
+        resolvedDownloadDir = downloadDir or self.tessCacheFolder
+
         try:
-            coord = SkyCoord(ra=float(raDeg) * u.deg, dec=float(decDeg) * u.deg, frame="icrs")
+            coord = SkyCoord(ra=float(sourceRaDeg) * u.deg, dec=float(sourceDecDeg) * u.deg, frame="icrs")
         except Exception as exc:
             self.logger.warning(
                 "Invalid sky coordinates for %s: %s",
@@ -545,7 +611,7 @@ class TessDataDownloader:
             tpfCollection = self._runWithFilteredWarnings(
                 searchResult.download_all,
                 cutout_size=cutoutSize,
-                download_dir=self.tessCacheFolder,
+                download_dir=resolvedDownloadDir,
                 ticId=self._normalizeTicId((ticCandidates[0] if ticCandidates else {}).get("ticId")),
                 warningContext="search_tesscut download_all",
             )
@@ -621,7 +687,6 @@ class TessDataDownloader:
         if standardizedLightCurve is None:
             return None
 
-        preferredCandidate = ticCandidates[0] if ticCandidates else {}
         chosenTicId = self._normalizeTicId(preferredCandidate.get("ticId")) or "NA"
 
         outputFile = os.path.join(self.tessCacheFolder, f"TIC_{chosenTicId}_TESSCut.fits")
@@ -635,8 +700,8 @@ class TessDataDownloader:
             "lightCurveAvailable": True,
             "extractionMetadata": {
                 "downloadMethod": "search_tesscut",
-                "sourceRaDeg": float(raDeg),
-                "sourceDecDeg": float(decDeg),
+                "sourceRaDeg": float(sourceRaDeg),
+                "sourceDecDeg": float(sourceDecDeg),
                 "cutoutSize": list(cutoutSize),
                 "sectorCount": len(extractedCurves),
                 "sectors": sectors,
@@ -656,6 +721,134 @@ class TessDataDownloader:
             "lowQualityReason": normalizationMetadata["lowQualityReason"],
         }
 
+    def _processSingleStar(self, idx, rowData, count, totalCount, cutoutSize, cleanupDownloads):
+        starName = rowData.get("VSXName", rowData.get("VSXId", f"row-{idx}"))
+        family = rowData.get("family")
+        self.logger.info(
+            "Processing star %d/%d: %s (family=%s)",
+            count,
+            totalCount,
+            starName,
+            family,
+        )
+
+        self._resetStarQuality()
+        os.makedirs(self._workerDownloadsRoot, exist_ok=True)
+        taskDownloadDir = os.path.join(
+            self._workerDownloadsRoot,
+            f"star_{idx}_{threading.get_ident()}_{int(time.time() * 1000)}",
+        )
+        os.makedirs(taskDownloadDir, exist_ok=True)
+
+        updates = {
+            "bestMatch": None,
+            "provenance": None,
+            "lightCurvePath": None,
+            "extractionMetadata": None,
+            "lightCurveAvailable": False,
+            "noLightCurveReason": None,
+            "normalizationApplied": None,
+            "fluxMedian": None,
+            "fluxStd": None,
+            "fluxSnr": None,
+            "medianUnstable": None,
+            "lowSNR": None,
+            "lowQualityLightCurve": None,
+            "lowQualityReason": None,
+            "quality": "missing",
+        }
+
+        ticCandidates = self._sortedTicCandidates(rowData.get("ticCandidates"))
+        preferredTicId = self._normalizeTicId(
+            (ticCandidates[0] if ticCandidates else {}).get("ticId")
+        )
+        matchedResult = None
+
+        try:
+            def _starTask():
+                nonlocal matchedResult
+
+                for candidate in ticCandidates:
+                    ticId = self._normalizeTicId(candidate.get("ticId"))
+                    if ticId is None:
+                        continue
+
+                    for author in ("SPOC", "QLP"):
+                        matchedResult = self._downloadCatalogLightCurve(
+                            ticId,
+                            author,
+                            downloadDir=taskDownloadDir,
+                        )
+                        if matchedResult is None:
+                            continue
+
+                        matchedResult["bestMatch"]["ticDistanceArcmin"] = candidate.get("ticDistanceArcmin")
+                        matchedResult["bestMatch"]["ticRaDeg"] = candidate.get("ticRaDeg")
+                        matchedResult["bestMatch"]["ticDecDeg"] = candidate.get("ticDecDeg")
+                        matchedResult["bestMatch"]["ticTmag"] = candidate.get("ticTmag")
+                        matchedResult["extractionMetadata"]["selectedCandidate"] = dict(candidate)
+                        return
+
+                matchedResult = self._extractTessCutLightCurve(
+                    rowData,
+                    ticCandidates,
+                    cutoutSize,
+                    downloadDir=taskDownloadDir,
+                )
+
+            self._runWithFilteredWarnings(
+                _starTask,
+                ticId=preferredTicId,
+                warningContext="star processing",
+            )
+
+            if matchedResult is None:
+                self.logger.error(
+                    "No usable TESS light curve found for %s after SPOC, QLP, and TESSCut attempts",
+                    starName,
+                )
+                updates["noLightCurveReason"] = (
+                    "No SPOC/QLP light curve and no usable TESSCut extraction"
+                )
+                updates["quality"] = self._finalizeStarQuality(False)
+                return idx, updates
+
+            updates.update(
+                {
+                    "bestMatch": matchedResult["bestMatch"],
+                    "provenance": matchedResult["provenance"],
+                    "lightCurvePath": matchedResult["lightCurvePath"],
+                    "extractionMetadata": matchedResult["extractionMetadata"],
+                    "lightCurveAvailable": matchedResult["lightCurveAvailable"],
+                    "normalizationApplied": matchedResult.get("normalizationApplied"),
+                    "fluxMedian": matchedResult.get("fluxMedian"),
+                    "fluxStd": matchedResult.get("fluxStd"),
+                    "fluxSnr": matchedResult.get("fluxSnr"),
+                    "medianUnstable": matchedResult.get("medianUnstable"),
+                    "lowSNR": matchedResult.get("lowSNR"),
+                    "lowQualityLightCurve": matchedResult.get("lowQualityLightCurve"),
+                    "lowQualityReason": matchedResult.get("lowQualityReason"),
+                    "quality": self._finalizeStarQuality(
+                        matchedResult.get("lightCurveAvailable", False)
+                    ),
+                }
+            )
+            return idx, updates
+        finally:
+            if cleanupDownloads:
+                self._cleanupTransientDownloads(taskDownloadDir)
+
+            try:
+                shutil.rmtree(taskDownloadDir)
+            except FileNotFoundError:
+                pass
+            except Exception as exc:
+                self.logger.warning(
+                    "Failed to remove worker download directory %s: %s",
+                    taskDownloadDir,
+                    exc,
+                )
+
     def downloadTessLightCurves(
         self,
         tessMetadataParquet,
@@ -663,6 +856,7 @@ class TessDataDownloader:
         cutoutSize=(15, 15),
         cleanupDownloads=True,
         lowSnrThreshold=None,
+        maxWorkers=None,
     ):
         """
         Download or extract TESS light curves for each star in cached metadata.
@@ -705,115 +899,117 @@ class TessDataDownloader:
             if column not in df.columns:
                 df[column] = [None] * len(df)
 
+        duplicateWarningCount = self._logDuplicateTicMappings(df)
+
         orderedIndices = df.sort_values(["family", "VSXName"], na_position="last").index.tolist()
-        currentFamily = None
+        workerCount = maxWorkers
+        if workerCount is None:
+            workerCount = min(4, max(1, len(orderedIndices)))
 
         try:
-            for count, idx in enumerate(orderedIndices, start=1):
-                row = df.loc[idx]
-                family = row.get("family")
-                if family != currentFamily:
-                    currentFamily = family
-                    self.logger.info("Processing family %s", family)
-
-                starName = row.get("VSXName", row.get("VSXId", f"row-{idx}"))
-                self.logger.info("Processing star %d/%d: %s", count, len(orderedIndices), starName)
-
-                self.currentStarQuality = "missing"
-
-                df.at[idx, "bestMatch"] = None
-                df.at[idx, "provenance"] = None
-                df.at[idx, "lightCurvePath"] = None
-                df.at[idx, "extractionMetadata"] = None
-                df.at[idx, "lightCurveAvailable"] = False
-                df.at[idx, "noLightCurveReason"] = None
-                df.at[idx, "normalizationApplied"] = None
-                df.at[idx, "fluxMedian"] = None
-                df.at[idx, "fluxStd"] = None
-                df.at[idx, "fluxSnr"] = None
-                df.at[idx, "medianUnstable"] = None
-                df.at[idx, "lowSNR"] = None
-                df.at[idx, "lowQualityLightCurve"] = None
-                df.at[idx, "lowQualityReason"] = None
-                df.at[idx, "quality"] = "missing"
-
-                ticCandidates = self._sortedTicCandidates(row.get("ticCandidates"))
-                preferredTicId = self._normalizeTicId(
-                    (ticCandidates[0] if ticCandidates else {}).get("ticId")
-                )
-                matchedResult = None
-
-                try:
-                    def _processStar():
-                        nonlocal matchedResult
-
-                        for candidate in ticCandidates:
-                            ticId = self._normalizeTicId(candidate.get("ticId"))
-                            if ticId is None:
-                                continue
-
-                            for author in ("SPOC", "QLP"):
-                                matchedResult = self._downloadCatalogLightCurve(ticId, author)
-                                if matchedResult is None:
-                                    continue
-
-                                matchedResult["bestMatch"]["ticDistanceArcmin"] = candidate.get("ticDistanceArcmin")
-                                matchedResult["bestMatch"]["ticRaDeg"] = candidate.get("ticRaDeg")
-                                matchedResult["bestMatch"]["ticDecDeg"] = candidate.get("ticDecDeg")
-                                matchedResult["bestMatch"]["ticTmag"] = candidate.get("ticTmag")
-                                matchedResult["extractionMetadata"]["selectedCandidate"] = dict(candidate)
-                                return
-
-                        matchedResult = self._extractTessCutLightCurve(row.to_dict(), ticCandidates, cutoutSize)
-
-                    self._runWithFilteredWarnings(
-                        _processStar,
-                        ticId=preferredTicId,
-                        warningContext="star processing",
-                    )
-
-                    if matchedResult is None:
-                        self.logger.error(
-                            "No usable TESS light curve found for %s after SPOC, QLP, and TESSCut attempts",
-                            starName,
+            if workerCount == 1:
+                for count, idx in enumerate(orderedIndices, start=1):
+                    try:
+                        _, updates = self._processSingleStar(
+                            idx,
+                            df.loc[idx].to_dict(),
+                            count,
+                            len(orderedIndices),
+                            cutoutSize,
+                            cleanupDownloads,
                         )
-                        df.at[idx, "noLightCurveReason"] = (
-                            "No SPOC/QLP light curve and no usable TESSCut extraction"
-                        )
-                        df.at[idx, "quality"] = self._finalizeStarQuality(False)
-                        continue
+                    except Exception as exc:
+                        row = df.loc[idx]
+                        starName = row.get("VSXName", row.get("VSXId", f"row-{idx}"))
+                        self.logger.exception("Star task failed for %s: %s", starName, exc)
+                        updates = {
+                            "bestMatch": None,
+                            "provenance": None,
+                            "lightCurvePath": None,
+                            "extractionMetadata": None,
+                            "lightCurveAvailable": False,
+                            "noLightCurveReason": f"Worker task failed: {exc}",
+                            "normalizationApplied": None,
+                            "fluxMedian": None,
+                            "fluxStd": None,
+                            "fluxSnr": None,
+                            "medianUnstable": None,
+                            "lowSNR": None,
+                            "lowQualityLightCurve": None,
+                            "lowQualityReason": None,
+                            "quality": "missing",
+                        }
+                    for column, value in updates.items():
+                        df.at[idx, column] = value
+            else:
+                with ThreadPoolExecutor(max_workers=workerCount) as executor:
+                    futureToIdx = {
+                        executor.submit(
+                            self._processSingleStar,
+                            idx,
+                            df.loc[idx].to_dict(),
+                            count,
+                            len(orderedIndices),
+                            cutoutSize,
+                            cleanupDownloads,
+                        ): idx
+                        for count, idx in enumerate(orderedIndices, start=1)
+                    }
 
-                    df.at[idx, "bestMatch"] = matchedResult["bestMatch"]
-                    df.at[idx, "provenance"] = matchedResult["provenance"]
-                    df.at[idx, "lightCurvePath"] = matchedResult["lightCurvePath"]
-                    df.at[idx, "extractionMetadata"] = matchedResult["extractionMetadata"]
-                    df.at[idx, "lightCurveAvailable"] = matchedResult["lightCurveAvailable"]
-                    df.at[idx, "normalizationApplied"] = matchedResult.get("normalizationApplied")
-                    df.at[idx, "fluxMedian"] = matchedResult.get("fluxMedian")
-                    df.at[idx, "fluxStd"] = matchedResult.get("fluxStd")
-                    df.at[idx, "fluxSnr"] = matchedResult.get("fluxSnr")
-                    df.at[idx, "medianUnstable"] = matchedResult.get("medianUnstable")
-                    df.at[idx, "lowSNR"] = matchedResult.get("lowSNR")
-                    df.at[idx, "lowQualityLightCurve"] = matchedResult.get("lowQualityLightCurve")
-                    df.at[idx, "lowQualityReason"] = matchedResult.get("lowQualityReason")
-                    df.at[idx, "quality"] = self._finalizeStarQuality(
-                        matchedResult.get("lightCurveAvailable", False)
-                    )
-                finally:
-                    if cleanupDownloads:
-                        self._cleanupTransientDownloads()
+                    for future in as_completed(futureToIdx):
+                        idx = futureToIdx[future]
+                        try:
+                            _, updates = future.result()
+                        except Exception as exc:
+                            row = df.loc[idx]
+                            starName = row.get("VSXName", row.get("VSXId", f"row-{idx}"))
+                            self.logger.exception("Star task failed for %s: %s", starName, exc)
+                            updates = {
+                                "bestMatch": None,
+                                "provenance": None,
+                                "lightCurvePath": None,
+                                "extractionMetadata": None,
+                                "lightCurveAvailable": False,
+                                "noLightCurveReason": f"Worker task failed: {exc}",
+                                "normalizationApplied": None,
+                                "fluxMedian": None,
+                                "fluxStd": None,
+                                "fluxSnr": None,
+                                "medianUnstable": None,
+                                "lowSNR": None,
+                                "lowQualityLightCurve": None,
+                                "lowQualityReason": None,
+                                "quality": "missing",
+                            }
+
+                        for column, value in updates.items():
+                            df.at[idx, column] = value
         finally:
             self.lowSnrThreshold = originalLowSnrThreshold
             if cleanupDownloads:
                 self._cleanupTransientDownloads()
+            try:
+                shutil.rmtree(self._workerDownloadsRoot)
+            except FileNotFoundError:
+                pass
+            except Exception as exc:
+                self.logger.warning(
+                    "Failed to remove worker download root %s: %s",
+                    self._workerDownloadsRoot,
+                    exc,
+                )
 
         augmentedPath = os.path.join(self.tessCacheFolder, augmentedMetadataFile)
         df.to_parquet(augmentedPath, index=False)
+        successCount = int(df["lightCurveAvailable"].eq(True).sum())
+        totalCount = int(len(df))
+        failedCount = totalCount - successCount
+        self.logger.info(
+            "Download summary: total=%d succeeded=%d failed=%d duplicateTicWarnings=%d",
+            totalCount,
+            successCount,
+            failedCount,
+            duplicateWarningCount,
+        )
         self.logger.info("Saved augmented metadata to %s", augmentedPath)
         return df
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    downloader = TessDataDownloader()
-    data = downloader.load('sample_stars.csv')
-    print(data)

@@ -309,15 +309,15 @@ class VSXCategoryLoader:
                 "tessUseCase": "Rare but scientifically valuable special class",
                 "mlNotes": "Good rare-class challenge set",
             },
-            # "UNKNOWN": {
-            #     "displayName": "Unknown / Unmapped",
-            #     "physicalMechanism": "Unspecified",
-            #     "signalType": "Unspecified",
-            #     "recommendedAlgorithm": "Review manually",
-            #     "typicalDifficulty": "unknown",
-            #     "tessUseCase": "Requires inspection",
-            #     "mlNotes": "Potential future expansion target",
-            # },
+            "UNKNOWN": {
+                "displayName": "Unknown / Unmapped",
+                "physicalMechanism": "Unspecified",
+                "signalType": "Unspecified",
+                "recommendedAlgorithm": "Review manually",
+                "typicalDifficulty": "unknown",
+                "tessUseCase": "Requires inspection",
+                "mlNotes": "Potential future expansion target",
+            },
         }
 
         # ------------------------------------------------------------
@@ -727,13 +727,50 @@ class VSXCategoryLoader:
         }
     
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     loader = VSXCategoryLoader()
 
     categoryRequests = {
         "ECLIPSING": 20,
         "RRLYR": 20,
-        "DSCT_SXPHE": 20
+        "DSCT_SXPHE": 20,
     }
 
-    categoryDictionary = loader.loadCategories(categoryRequests=categoryRequests)
-    loader.close()
+    try:
+        supportedFamilies = set(loader.getSupportedFamilies())
+        unsupportedFamilies = [
+            family for family in categoryRequests.keys()
+            if family not in supportedFamilies
+        ]
+        if unsupportedFamilies:
+            loader.logger.warning(
+                "Requested unsupported families: %s",
+                unsupportedFamilies,
+            )
+
+        categoryDictionary = loader.loadCategories(categoryRequests=categoryRequests)
+
+        totalLoaded = sum(len(stars) for stars in categoryDictionary.values())
+        loader.logger.info("Loaded %d stars across %d families", totalLoaded, len(categoryDictionary))
+
+        for family, stars in categoryDictionary.items():
+            requestedCount = categoryRequests.get(family)
+            loader.logger.info(
+                "Family %s: requested=%s loaded=%d",
+                family,
+                requestedCount,
+                len(stars),
+            )
+
+            if stars:
+                sample = stars[0]
+                loader.logger.info(
+                    "Sample %s star: VSXName=%s VSXType=%s RA=%.6f Dec=%.6f",
+                    family,
+                    sample.get("VSXName"),
+                    sample.get("VSXType"),
+                    sample.get("raDeg") if sample.get("raDeg") is not None else float("nan"),
+                    sample.get("decDeg") if sample.get("decDeg") is not None else float("nan"),
+                )
+    finally:
+        loader.close()

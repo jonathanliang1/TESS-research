@@ -21,7 +21,7 @@ class VSX2TESSConverter:
         """
         Crossmatch AAVSO VSX variable-star record to the TESS Input Catalog using RA/Dec.
 
-        The returned record includes a `ticMatches` list containing up to
+        The returned record includes a `ticCandidates` list containing up to
         `maxMatches` candidates sorted by angular separation from the VSX target.
         Each candidate has: ticId, ticRaDeg, ticDecDeg, ticTmag, ticDistanceArcmin.
 
@@ -67,7 +67,11 @@ class VSX2TESSConverter:
                 try:
                     ticRaDeg = float(row["ra"])
                     ticDecDeg = float(row["dec"])
-                    ticTmag = float(row["Tmag"])
+                    ticTmagRaw = row["Tmag"]
+                    try:
+                        ticTmag = float(ticTmagRaw)
+                    except Exception:
+                        ticTmag = None
 
                     
                     ticCoord = SkyCoord(
@@ -215,44 +219,51 @@ class VSX2TESSConverter:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     converter = VSX2TESSConverter()
-    # Example usage:
 
-    #check RR Lyr
-    starRecord = {"raDeg": 291.36629, "decDeg":  42.78436, "VSXName": ""}
-    tessRecord = converter.crossmatchToTic(starRecord)
-    if tessRecord['ticId'] != '159717514':
-        converter.logger.error("RR Lyrae crossmatch failed: expected TIC ID 159717514, got %s", tessRecord['ticId'])
-    else:
-        converter.logger.info("RR Lyr crossmatch succeeded: TIC ID %s", tessRecord['ticId'])
+    def _check_crossmatch(starRecord, expectedTicId, label):
+        tessRecord = converter.crossmatchToTic(starRecord)
+        if tessRecord is None:
+            converter.logger.error("%s crossmatch failed: no TIC candidates returned", label)
+            return
 
-    #check TV Boo 
-    starRecord = {"raDeg": 214.15242, "decDeg": 42.35992, "VSXName": ""}
-    tessRecord = converter.crossmatchToTic(starRecord)
-    if tessRecord['ticId'] != '168709463':
-        logger.error("TV Boo crossmatch failed: expected TIC ID 168709463, got %s", tessRecord['ticId'])
-    else:
-        logger.info("TV Boo crossmatch succeeded: TIC ID %s", tessRecord['ticId'])
+        ticCandidates = tessRecord.get("ticCandidates", [])
+        if not ticCandidates:
+            converter.logger.error("%s crossmatch failed: empty ticCandidates", label)
+            return
 
-    #check V1334 Cyg
-    starRecord = {"raDeg": 319.84242, "decDeg": 38.23747, "VSXName": ""}
-    tessRecord = converter.crossmatchToTic(starRecord)
-    if tessRecord['ticId'] != '373202340':
-        logger.error("V1334 Cyg crossmatch failed: expected TIC ID 373202340, got %s", tessRecord['ticId'])
-    else:
-        logger.info("V1334 Cyg crossmatch succeeded: TIC ID %s", tessRecord['ticId'])
+        bestTicId = str(ticCandidates[0].get("ticId"))
+        if bestTicId != str(expectedTicId):
+            converter.logger.error(
+                "%s crossmatch failed: expected TIC ID %s, got %s",
+                label,
+                expectedTicId,
+                bestTicId,
+            )
+        else:
+            converter.logger.info("%s crossmatch succeeded: TIC ID %s", label, bestTicId)
 
-    #check TT Lyn
-    starRecord = {"raDeg": 135.78246, "decDeg":  44.58558, "VSXName": ""}
-    tessRecord = converter.crossmatchToTic(starRecord)
-    if tessRecord['ticId'] != '29172806':
-        logger.error("TT Lyn crossmatch failed: expected TIC ID 29172806, got %s", tessRecord['ticId'])
-    else:
-        logger.info("TT Lyn crossmatch succeeded: TIC ID %s", tessRecord['ticId'])
-
-    #check AU Peg
-    starRecord = {"raDeg": 321.00100, "decDeg":  18.27883, "VSXName": ""}
-    tessRecord = converter.crossmatchToTic(starRecord)
-    if tessRecord['ticId'] != '279587090':
-        logger.error("AU Peg crossmatch failed: expected TIC ID 279587090, got %s", tessRecord['ticId'])
-    else:
-        logger.info("AU Peg crossmatch succeeded: TIC ID %s", tessRecord['ticId'])
+    _check_crossmatch(
+        {"raDeg": 291.36629, "decDeg": 42.78436, "VSXName": ""},
+        "159717514",
+        "RR Lyr",
+    )
+    _check_crossmatch(
+        {"raDeg": 214.15242, "decDeg": 42.35992, "VSXName": ""},
+        "168709463",
+        "TV Boo",
+    )
+    _check_crossmatch(
+        {"raDeg": 319.84242, "decDeg": 38.23747, "VSXName": ""},
+        "373202340",
+        "V1334 Cyg",
+    )
+    _check_crossmatch(
+        {"raDeg": 135.78246, "decDeg": 44.58558, "VSXName": ""},
+        "29172806",
+        "TT Lyn",
+    )
+    _check_crossmatch(
+        {"raDeg": 321.00100, "decDeg": 18.27883, "VSXName": ""},
+        "279587090",
+        "AU Peg",
+    )
