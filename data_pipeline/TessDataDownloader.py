@@ -568,16 +568,47 @@ class TessDataDownloader:
         }
 
     def _extractTessCutLightCurve(self, starRecord, ticCandidates, cutoutSize, downloadDir=None):
-        preferredCandidate = ticCandidates[0] if ticCandidates else {}
+        selectedCandidate = {}
+        selectedCandidateRank = None
+        sourceRaDeg = None
+        sourceDecDeg = None
 
-        # Prefer the selected TIC candidate position for TESSCut centering.
-        sourceRaDeg = preferredCandidate.get("ticRaDeg")
-        sourceDecDeg = preferredCandidate.get("ticDecDeg")
+        sortedCandidates = self._sortedTicCandidates(ticCandidates)
 
-        # Fall back to original VSX coordinates if candidate coordinates are missing.
+        # Use the first TIC candidate that has both coordinates populated.
+        for rank, candidate in enumerate(sortedCandidates, start=1):
+            candidateRaDeg = candidate.get("ticRaDeg")
+            candidateDecDeg = candidate.get("ticDecDeg")
+            if candidateRaDeg is None or candidateDecDeg is None:
+                continue
+            selectedCandidate = candidate
+            selectedCandidateRank = rank
+            sourceRaDeg = candidateRaDeg
+            sourceDecDeg = candidateDecDeg
+            break
+
+        # Fall back to original VSX coordinates only when no TIC candidate has coordinates.
         if sourceRaDeg is None or sourceDecDeg is None:
             sourceRaDeg = starRecord.get("raDeg")
             sourceDecDeg = starRecord.get("decDeg")
+
+        # Preserve prior behavior for TIC-based metadata if no candidate had usable coordinates.
+        if not selectedCandidate:
+            selectedCandidate = (sortedCandidates[0] if sortedCandidates else {})
+
+        if selectedCandidateRank is not None:
+            self.logger.info(
+                "TESSCut fallback will use TIC candidate rank %d TIC=%s distance=%s arcmin for VSX=%s",
+                selectedCandidateRank,
+                selectedCandidate.get("ticId"),
+                selectedCandidate.get("ticDistanceArcmin"),
+                starRecord.get("VSXId"),
+            )
+        else:
+            self.logger.info(
+                "TESSCut fallback has no TIC candidate with valid coordinates; using original VSX coords for VSX=%s",
+                starRecord.get("VSXId"),
+            )
 
         if sourceRaDeg is None or sourceDecDeg is None:
             return None
@@ -612,7 +643,7 @@ class TessDataDownloader:
                 searchResult.download_all,
                 cutout_size=cutoutSize,
                 download_dir=resolvedDownloadDir,
-                ticId=self._normalizeTicId((ticCandidates[0] if ticCandidates else {}).get("ticId")),
+                ticId=self._normalizeTicId(selectedCandidate.get("ticId")),
                 warningContext="search_tesscut download_all",
             )
         except Exception as exc:
@@ -640,7 +671,7 @@ class TessDataDownloader:
                 lightCurve = self._runWithFilteredWarnings(
                     tpf.to_lightcurve,
                     aperture_mask=apertureMask,
-                    ticId=self._normalizeTicId((ticCandidates[0] if ticCandidates else {}).get("ticId")),
+                    ticId=self._normalizeTicId(selectedCandidate.get("ticId")),
                     warningContext="TESSCut to_lightcurve",
                 ).remove_nans()
                 if len(lightCurve) == 0:
@@ -687,7 +718,7 @@ class TessDataDownloader:
         if standardizedLightCurve is None:
             return None
 
-        chosenTicId = self._normalizeTicId(preferredCandidate.get("ticId")) or "NA"
+        chosenTicId = self._normalizeTicId(selectedCandidate.get("ticId")) or "NA"
 
         outputFile = os.path.join(self.tessCacheFolder, f"TIC_{chosenTicId}_TESSCut.fits")
         if not self._storeLightCurve(standardizedLightCurve, outputFile, chosenTicId, "TESSCut"):
@@ -707,7 +738,7 @@ class TessDataDownloader:
                 "sectors": sectors,
                 "aperturePixelCounts": aperturePixelCounts,
                 "selectedCandidateTicId": chosenTicId,
-                "selectedCandidateDistanceArcmin": preferredCandidate.get("ticDistanceArcmin"),
+                "selectedCandidateDistanceArcmin": selectedCandidate.get("ticDistanceArcmin"),
                 "extractionMethod": "threshold_mask_photometry",
                 "fluxNormalization": normalizationMetadata,
             },
