@@ -178,6 +178,14 @@ class TessDataDownloader:
 
         return str(int(digits))
 
+    def _sanitizeFilenameComponent(self, value):
+        """Sanitize a string for use in filenames by replacing spaces and special chars with underscores."""
+        if value is None:
+            return None
+        # Replace spaces and other problematic characters with underscores
+        sanitized = str(value).replace(" ", "_").replace(",", "_").replace(":", "_")
+        return sanitized
+
     def _sortedTicCandidates(self, ticCandidates):
         if ticCandidates is None:
             return []
@@ -533,8 +541,9 @@ class TessDataDownloader:
         if standardizedLightCurve is None:
             return None
 
-        vsxIdStr = f"VSX_{vsxId}_" if vsxId else ""
-        outputFile = os.path.join(self.tessCacheFolder, f"{vsxIdStr}_TIC_{ticId}_{author}.fits")
+        sanitizedVsxId = self._sanitizeFilenameComponent(vsxId)
+        vsxIdStr = f"VSX_{sanitizedVsxId}_" if sanitizedVsxId else ""
+        outputFile = os.path.join(self.tessCacheFolder, f"{vsxIdStr}TIC_{ticId}_{author}.fits")
         if not self._storeLightCurve(standardizedLightCurve, outputFile, ticId, author):
             return None
 
@@ -721,8 +730,9 @@ class TessDataDownloader:
 
         chosenTicId = self._normalizeTicId(selectedCandidate.get("ticId")) or "NA"
         vsxId = starRecord.get("VSXId", "NA")
+        sanitizedVsxId = self._sanitizeFilenameComponent(vsxId)
 
-        outputFile = os.path.join(self.tessCacheFolder, f"VSX_{vsxId}_TIC_{chosenTicId}_TESSCut.fits")
+        outputFile = os.path.join(self.tessCacheFolder, f"VSX_{sanitizedVsxId}_TIC_{chosenTicId}_TESSCut.fits")
         if not self._storeLightCurve(standardizedLightCurve, outputFile, chosenTicId, "TESSCut"):
             return None
 
