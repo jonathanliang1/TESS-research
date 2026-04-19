@@ -501,7 +501,7 @@ class TessDataDownloader:
                 packageLogger.setLevel(level)
                 packageLogger.disabled = disabled
 
-    def _downloadCatalogLightCurve(self, ticId, author, downloadDir=None):
+    def _downloadCatalogLightCurve(self, ticId, author, downloadDir=None, vsxId=None):
         try:
             searchResult = self._runQuietLightkurveSearch(
                 lk.search_lightcurve,
@@ -533,7 +533,8 @@ class TessDataDownloader:
         if standardizedLightCurve is None:
             return None
 
-        outputFile = os.path.join(self.tessCacheFolder, f"TIC_{ticId}_{author}.fits")
+        vsxIdStr = f"VSX_{vsxId}_" if vsxId else ""
+        outputFile = os.path.join(self.tessCacheFolder, f"{vsxIdStr}_TIC_{ticId}_{author}.fits")
         if not self._storeLightCurve(standardizedLightCurve, outputFile, ticId, author):
             return None
 
@@ -719,8 +720,9 @@ class TessDataDownloader:
             return None
 
         chosenTicId = self._normalizeTicId(selectedCandidate.get("ticId")) or "NA"
+        vsxId = starRecord.get("VSXId", "NA")
 
-        outputFile = os.path.join(self.tessCacheFolder, f"TIC_{chosenTicId}_TESSCut.fits")
+        outputFile = os.path.join(self.tessCacheFolder, f"VSX_{vsxId}_TIC_{chosenTicId}_TESSCut.fits")
         if not self._storeLightCurve(standardizedLightCurve, outputFile, chosenTicId, "TESSCut"):
             return None
 
@@ -809,6 +811,7 @@ class TessDataDownloader:
                             ticId,
                             author,
                             downloadDir=taskDownloadDir,
+                            vsxId=rowData.get("VSXId"),
                         )
                         if matchedResult is None:
                             continue
