@@ -6,6 +6,7 @@ import pandas as pd
 import logging
 import sys
 import os
+import argparse
 
 class ResearchPipeline:
     """
@@ -79,27 +80,22 @@ class ResearchPipeline:
                     self.tessMatchedDict[family].append(starRecord)
             return self.tessMatchedDict
         else:
-            self.logger.error(f"Metadata file {self.metadataFile} does not exist.")
-            return RuntimeError(f"Metadata file {self.metadataFile} does not exist.")
+            self.logger.warning(f"Metadata file {self.metadataFile} does not exist.")
+            return None
     
-    def loadCandidates(self, fromCache=True):
+    def loadCandidates(self):
         """
-        if fromCache is True, attempts to load cached metadata and TIC IDs.
-        If fromCache is False or cached data is unavailable, runs the full pipeline
+        Load candidates from cache if available, otherwise run the full pipeline
         from scratch: loads VSX categories, crossmatches them to the TESS Input Catalog,
-        and caches both the TIC IDs and metadata for downstream analysis.
+        and caches the metadata for downstream analysis.
         """
-        if fromCache:
-            tessData = self.loadCachedMetadata()
-            if tessData is not None:
-                return tessData
-            else:
-                self.logger.error("Cached TESS metadata not found or failed to load. Running full pipeline.")
-                raise RuntimeError("Cached TESS metadata not found or failed to load. Running full pipeline.")
-
-        tessData = self.combineVSXTESS()
-        self.cacheMetadata(tessData, metadataFile="VSXMetadata.parquet")
-        return tessData
+        metadata_file_path = os.path.join(self.tessCacheFolder, "VSXMetadata.parquet")
+        if os.path.exists(metadata_file_path):
+            return self.loadCachedMetadata()
+        else:
+            tessData = self.combineVSXTESS()
+            self.cacheMetadata(tessData, metadataFile="VSXMetadata.parquet")
+            return tessData
 
     def countBestMatchesByFamily(self, tessMetadataParquet):
         """
@@ -135,24 +131,51 @@ class ResearchPipeline:
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        stream=sys.stdout,
-        level=logging.INFO,
-        format="%(levelname)s:%(filename)s:%(lineno)d:%(message)s",
-        force=True,
-    )
-    logger = logging.getLogger()
-    reload = False
+    parser = argparse.ArgumentParser(description="Run TESS research pipeline.")
+    parser.add_argument('--logfile', '-l', help='Log file name to write logs to. If not specified, logs to stdout.')
+    args = parser.parse_args()
 
-    vsxLoader = VSXCategoryLoader(refreshCache=reload)
-    tessConverter = VSX2TESSConverter()
+    log_format = "%(asctime)s %(levelname)s:%(filename)s:%(lineno)d:%(message)s"
+    log_file = None
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
 
-    pipeline = ResearchPipeline(vsxLoader, tessConverter)
-    tessMetadata = pipeline.loadCandidates()
-    print("TESS Metadata loaded for %d variable star candidates across %d families" % (sum(len(stars) for stars in tessMetadata.values()), len(tessMetadata)))
-    stat, total = pipeline.countBestMatchesByFamily(pipeline.tessCacheFolder + os.path.sep + "VSXMetadata.parquet")
-    for family, count in stat.items():
-        print(f"Family {family}: {count} stars with bestMatch, out of {len(tessMetadata.get(family, []))} total stars in family")
-    print(f"Total stars with bestMatch: {total} out of {sum(len(stars) for stars in tessMetadata.values())} candidates")
-    tessDataloader = TessDataDownloader()
-    augmented = tessDataloader.downloadTessLightCurves("VSXMetadata.parquet")
+    if args.logfile:
+        logging.basicConfig(
+            filename=args.logfile,
+            level=logging.INFO,
+            format=log_format,
+            force=True,
+        )
+        log_file = open(args.logfile, "a", encoding="utf-8")
+        sys.stdout = log_file
+        sys.stderr = log_file
+    else:
+        logging.basicConfig(
+            stream=sys.stdout,
+            level=logging.INFO,
+            format=log_format,
+            force=True,
+        )
+
+    try:
+        logger = logging.getLogger()
+        reload = False
+
+        vsxLoader = VSXCategoryLoader(refreshCache=reload)
+        tessConverter = VSX2TESSConverter()
+
+        pipeline = ResearchPipeline(vsxLoader, tessConverter)
+        tessMetadata = pipeline.loadCandidates()
+        print("TESS Metadata loaded for %d variable star candidates across %d families" % (sum(len(stars) for stars in tessMetadata.values()), len(tessMetadata)))
+        stat, total = pipeline.countBestMatchesByFamily(pipeline.tessCacheFolder + os.path.sep + "VSXMetadata.parquet")
+        for family, count in stat.items():
+            print(f"Family {family}: {count} stars with bestMatch, out of {len(tessMetadata.get(family, []))} total stars in family")
+        print(f"Total stars with bestMatch: {total} out of {sum(len(stars) for stars in tessMetadata.values())} candidates")
+        tessDataloader = TessDataDownloader()
+        augmented = tessDataloader.downloadTessLightCurves("VSXMetadata.parquet")
+    finally:
+        if log_file is not None:
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+            log_file.close()

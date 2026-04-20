@@ -537,14 +537,21 @@ class TessDataDownloader:
         if lightCurve is None:
             return None
 
+        # Save raw light curve
+        sanitizedVsxId = self._sanitizeFilenameComponent(vsxId)
+        vsxIdStr = f"VSX_{sanitizedVsxId}_" if sanitizedVsxId else ""
+        rawOutputFile = os.path.join(self.tessCacheFolder, f"{vsxIdStr}TIC_{ticId}_{author}_raw.fits")
+        if not self._storeLightCurve(lightCurve, rawOutputFile, ticId, f"{author}_raw"):
+            return None
+
+        # Standardize light curve
         standardizedLightCurve, normalizationMetadata = self._standardizeLightCurve(lightCurve)
         if standardizedLightCurve is None:
             return None
 
-        sanitizedVsxId = self._sanitizeFilenameComponent(vsxId)
-        vsxIdStr = f"VSX_{sanitizedVsxId}_" if sanitizedVsxId else ""
-        outputFile = os.path.join(self.tessCacheFolder, f"{vsxIdStr}TIC_{ticId}_{author}.fits")
-        if not self._storeLightCurve(standardizedLightCurve, outputFile, ticId, author):
+        # Save standardized light curve
+        standardizedOutputFile = os.path.join(self.tessCacheFolder, f"{vsxIdStr}TIC_{ticId}_{author}_standardized.fits")
+        if not self._storeLightCurve(standardizedLightCurve, standardizedOutputFile, ticId, f"{author}_standardized"):
             return None
 
         sectors = []
@@ -558,7 +565,8 @@ class TessDataDownloader:
         return {
             "bestMatch": {"ticId": ticId, "author": author},
             "provenance": author,
-            "lightCurvePath": outputFile,
+            "lightCurvePath": standardizedOutputFile,  # Standardized by default
+            "rawLightCurvePath": rawOutputFile,
             "lightCurveAvailable": True,
             "extractionMetadata": {
                 "downloadMethod": "search_lightcurve",
@@ -724,22 +732,29 @@ class TessDataDownloader:
         if len(stitched) == 0:
             return None
 
+        # Save raw light curve
+        chosenTicId = self._normalizeTicId(selectedCandidate.get("ticId")) or "NA"
+        vsxId = starRecord.get("VSXId", "NA")
+        sanitizedVsxId = self._sanitizeFilenameComponent(vsxId)
+        rawOutputFile = os.path.join(self.tessCacheFolder, f"VSX_{sanitizedVsxId}_TIC_{chosenTicId}_TESSCut_raw.fits")
+        if not self._storeLightCurve(stitched, rawOutputFile, chosenTicId, "TESSCut_raw"):
+            return None
+
+        # Standardize light curve
         standardizedLightCurve, normalizationMetadata = self._standardizeLightCurve(stitched)
         if standardizedLightCurve is None:
             return None
 
-        chosenTicId = self._normalizeTicId(selectedCandidate.get("ticId")) or "NA"
-        vsxId = starRecord.get("VSXId", "NA")
-        sanitizedVsxId = self._sanitizeFilenameComponent(vsxId)
-
-        outputFile = os.path.join(self.tessCacheFolder, f"VSX_{sanitizedVsxId}_TIC_{chosenTicId}_TESSCut.fits")
-        if not self._storeLightCurve(standardizedLightCurve, outputFile, chosenTicId, "TESSCut"):
+        # Save standardized light curve
+        standardizedOutputFile = os.path.join(self.tessCacheFolder, f"VSX_{sanitizedVsxId}_TIC_{chosenTicId}_TESSCut_standardized.fits")
+        if not self._storeLightCurve(standardizedLightCurve, standardizedOutputFile, chosenTicId, "TESSCut_standardized"):
             return None
 
         return {
             "bestMatch": {"ticId": chosenTicId, "author": "TESSCut"},
             "provenance": "TESSCut",
-            "lightCurvePath": outputFile,
+            "lightCurvePath": standardizedOutputFile,  # Standardized by default
+            "rawLightCurvePath": rawOutputFile,
             "lightCurveAvailable": True,
             "extractionMetadata": {
                 "downloadMethod": "search_tesscut",
@@ -787,6 +802,7 @@ class TessDataDownloader:
             "bestMatch": None,
             "provenance": None,
             "lightCurvePath": None,
+            "rawLightCurvePath": None,
             "extractionMetadata": None,
             "lightCurveAvailable": False,
             "noLightCurveReason": None,
@@ -862,6 +878,7 @@ class TessDataDownloader:
                     "bestMatch": matchedResult["bestMatch"],
                     "provenance": matchedResult["provenance"],
                     "lightCurvePath": matchedResult["lightCurvePath"],
+                    "rawLightCurvePath": matchedResult.get("rawLightCurvePath"),
                     "extractionMetadata": matchedResult["extractionMetadata"],
                     "lightCurveAvailable": matchedResult["lightCurveAvailable"],
                     "normalizationApplied": matchedResult.get("normalizationApplied"),
@@ -927,6 +944,7 @@ class TessDataDownloader:
             "bestMatch",
             "provenance",
             "lightCurvePath",
+            "rawLightCurvePath",
             "extractionMetadata",
             "lightCurveAvailable",
             "noLightCurveReason",
@@ -970,6 +988,7 @@ class TessDataDownloader:
                             "bestMatch": None,
                             "provenance": None,
                             "lightCurvePath": None,
+                            "rawLightCurvePath": None,
                             "extractionMetadata": None,
                             "lightCurveAvailable": False,
                             "noLightCurveReason": f"Worker task failed: {exc}",
@@ -1012,6 +1031,7 @@ class TessDataDownloader:
                                 "bestMatch": None,
                                 "provenance": None,
                                 "lightCurvePath": None,
+                                "rawLightCurvePath": None,
                                 "extractionMetadata": None,
                                 "lightCurveAvailable": False,
                                 "noLightCurveReason": f"Worker task failed: {exc}",
