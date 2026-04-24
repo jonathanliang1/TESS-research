@@ -1,0 +1,12 @@
+2026-04-22 20:50:59,501 INFO:TessDataDownloader.py:965:Loading existing augmented metadata from TESSCache/TESSAugmented.parquet to resume processing
+TESS Metadata loaded for 7370 variable star candidates across 9 families
+Family CEPHEID: 148 stars with bestMatch, out of 1000 total stars in family
+Family CV: 64 stars with bestMatch, out of 603 total stars in family
+Family DSCT_SXPHE: 152 stars with bestMatch, out of 997 total stars in family
+Family ECLIPSING: 138 stars with bestMatch, out of 998 total stars in family
+Family ELLIPSOIDAL_ROT: 234 stars with bestMatch, out of 1000 total stars in family
+Family LONG_PERIOD: 623 stars with bestMatch, out of 991 total stars in family
+Family RRLYR: 33 stars with bestMatch, out of 1000 total stars in family
+Family XRAY: 27 stars with bestMatch, out of 56 total stars in family
+Family YSO: 185 stars with bestMatch, out of 725 total stars in family
+Total stars with bestMatch: 1604 out of 7370 candidates

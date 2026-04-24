@@ -7,6 +7,7 @@ import logging
 import sys
 import os
 import argparse
+import numpy as np
 
 class ResearchPipeline:
     """
@@ -158,13 +159,35 @@ if __name__ == "__main__":
             force=True,
         )
 
-    try:
-        logger = logging.getLogger()
+    logger = logging.getLogger()
+
+    if False:
+        try:
+            reload = False
+
+            vsxLoader = VSXCategoryLoader(refreshCache=reload)
+            tessConverter = VSX2TESSConverter()
+
+            pipeline = ResearchPipeline(vsxLoader, tessConverter)
+            tessMetadata = pipeline.loadCandidates()
+            print("TESS Metadata loaded for %d variable star candidates across %d families" % (sum(len(stars) for stars in tessMetadata.values()), len(tessMetadata)))
+            stat, total = pipeline.countBestMatchesByFamily(pipeline.tessCacheFolder + os.path.sep + "VSXMetadata.parquet")
+            for family, count in stat.items():
+                print(f"Family {family}: {count} stars with bestMatch, out of {len(tessMetadata.get(family, []))} total stars in family")
+            print(f"Total stars with bestMatch: {total} out of {sum(len(stars) for stars in tessMetadata.values())} candidates")
+            tessDataloader = TessDataDownloader()
+            augmented = tessDataloader.downloadTessLightCurves("VSXMetadata.parquet")
+        finally:
+            if log_file is not None:
+                sys.stdout = original_stdout
+                sys.stderr = original_stderr
+                log_file.close()
+
+    if False:
         reload = False
 
         vsxLoader = VSXCategoryLoader(refreshCache=reload)
         tessConverter = VSX2TESSConverter()
-
         pipeline = ResearchPipeline(vsxLoader, tessConverter)
         tessMetadata = pipeline.loadCandidates()
         print("TESS Metadata loaded for %d variable star candidates across %d families" % (sum(len(stars) for stars in tessMetadata.values()), len(tessMetadata)))
@@ -172,10 +195,47 @@ if __name__ == "__main__":
         for family, count in stat.items():
             print(f"Family {family}: {count} stars with bestMatch, out of {len(tessMetadata.get(family, []))} total stars in family")
         print(f"Total stars with bestMatch: {total} out of {sum(len(stars) for stars in tessMetadata.values())} candidates")
-        tessDataloader = TessDataDownloader()
-        augmented = tessDataloader.downloadTessLightCurves("VSXMetadata.parquet")
-    finally:
-        if log_file is not None:
-            sys.stdout = original_stdout
-            sys.stderr = original_stderr
-            log_file.close()
+
+    if True:
+        df = pd.read_parquet("/data/projects/TESS-research/data_pipeline/TESSCache/TESSAugmented.parquet")
+
+        # Count provenance by family
+        print("\n" + "="*80)
+        print("Provenance Summary by Family")
+        print("="*80)
+        
+        provenance_counts = df.groupby(["family", "provenance"]).size().unstack(fill_value=0)
+        
+        for family in sorted(df["family"].unique()):
+            if family in provenance_counts.index:
+                tesscut_count = provenance_counts.loc[family, "TESSCut"] if "TESSCut" in provenance_counts.columns else 0
+                spoc_count = provenance_counts.loc[family, "SPOC"] if "SPOC" in provenance_counts.columns else 0
+                qlp_count = provenance_counts.loc[family, "QLP"] if "QLP" in provenance_counts.columns else 0
+                none_count = provenance_counts.loc[family, np.nan] if np.nan in provenance_counts.columns else 0
+                
+                total_family = tesscut_count + spoc_count + qlp_count + none_count
+                print(f"\nFamily {family}:")
+                print(f"  TESSCut:  {tesscut_count}")
+                print(f"  SPOC:     {spoc_count}")
+                print(f"  QLP:      {qlp_count}")
+                print(f"  Missing:  {none_count}")
+                print(f"  Total:    {total_family}")
+        
+        print("\n" + "="*80)
+        print("Overall Provenance Summary")
+        print("="*80)
+        
+        total_count = len(df)
+        tesscut_total = (df["provenance"] == "TESSCut").sum()
+        spoc_total = (df["provenance"] == "SPOC").sum()
+        qlp_total = (df["provenance"] == "QLP").sum()
+        missing_total = df["provenance"].isna().sum()
+        
+        print(f"\nTESSCut:  {tesscut_total:6d} ({100.0 * tesscut_total / total_count:6.2f}%)")
+        print(f"SPOC:     {spoc_total:6d} ({100.0 * spoc_total / total_count:6.2f}%)")
+        print(f"QLP:      {qlp_total:6d} ({100.0 * qlp_total / total_count:6.2f}%)")
+        print(f"Missing:  {missing_total:6d} ({100.0 * missing_total / total_count:6.2f}%)")
+        print("-" * 40)
+        print(f"Total:    {total_count:6d} (100.00%)")
+        
+        

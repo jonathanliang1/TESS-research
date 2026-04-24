@@ -2,6 +2,7 @@ import pandas as pd
 import lightkurve as lk
 import logging
 import os
+import glob
 import re
 import sys
 import time
@@ -817,6 +818,24 @@ class TessDataDownloader:
             "quality": "missing",
         }
 
+        # Check if files already exist
+        vsxId = rowData.get("VSXId")
+        if vsxId:
+            sanitized = self._sanitizeFilenameComponent(vsxId)
+            std_pattern = os.path.join(self.tessCacheFolder, f"VSX_{sanitized}_*standardized.fits")
+            std_files = glob.glob(std_pattern)
+            if std_files:
+                std_path = std_files[0]
+                raw_path = std_path.replace('_standardized.fits', '_raw.fits')
+                if os.path.exists(raw_path):
+                    updates["lightCurvePath"] = std_path
+                    updates["rawLightCurvePath"] = raw_path
+                    updates["lightCurveAvailable"] = True
+                    updates["provenance"] = "existing"
+                    updates["quality"] = "existing"
+                    self.logger.info("Skipping %s: files already exist", starName)
+                    return idx, updates
+
         ticCandidates = self._sortedTicCandidates(rowData.get("ticCandidates"))
         preferredTicId = self._normalizeTicId(
             (ticCandidates[0] if ticCandidates else {}).get("ticId")
@@ -940,30 +959,58 @@ class TessDataDownloader:
                 f"Missing required columns in {metadataPath}: {sorted(missingColumns)}"
             )
 
-        for column in [
-            "bestMatch",
-            "provenance",
-            "lightCurvePath",
-            "rawLightCurvePath",
-            "extractionMetadata",
-            "lightCurveAvailable",
-            "noLightCurveReason",
-            "normalizationApplied",
-            "fluxMedian",
-            "fluxStd",
-            "fluxSnr",
-            "medianUnstable",
-            "lowSNR",
-            "lowQualityLightCurve",
-            "lowQualityReason",
-            "quality",
-        ]:
-            if column not in df.columns:
-                df[column] = [None] * len(df)
+        # Check if augmented metadata exists to resume from previous run
+        augmentedPath = os.path.join(self.tessCacheFolder, augmentedMetadataFile)
+        if os.path.exists(augmentedPath):
+            self.logger.info("Loading existing augmented metadata from %s to resume processing", augmentedPath)
+            df = pd.read_parquet(augmentedPath)
+        else:
+            # Initialize columns if starting fresh
+            for column in [
+                "bestMatch",
+                "provenance",
+                "lightCurvePath",
+                "rawLightCurvePath",
+                "extractionMetadata",
+                "lightCurveAvailable",
+                "noLightCurveReason",
+                "normalizationApplied",
+                "fluxMedian",
+                "fluxStd",
+                "fluxSnr",
+                "medianUnstable",
+                "lowSNR",
+                "lowQualityLightCurve",
+                "lowQualityReason",
+                "quality",
+            ]:
+                if column not in df.columns:
+                    df[column] = [None] * len(df)
 
         duplicateWarningCount = self._logDuplicateTicMappings(df)
 
+        # Only process stars that don't have both raw and standardized files
         orderedIndices = df.sort_values(["family", "VSXName"], na_position="last").index.tolist()
+        def has_both_files(row):
+            lc_path = row.get("lightCurvePath")
+            raw_path = row.get("rawLightCurvePath")
+            return lc_path and raw_path and os.path.exists(lc_path) and os.path.exists(raw_path)
+        orderedIndices = [idx for idx in orderedIndices if not has_both_files(df.loc[idx])]
+
+        if not orderedIndices:
+            self.logger.info("All stars already have light curves available. Skipping download.")
+            successCount = int(df["lightCurveAvailable"].eq(True).sum())
+            totalCount = int(len(df))
+            failedCount = totalCount - successCount
+            self.logger.info(
+                "Download summary: total=%d succeeded=%d failed=%d duplicateTicWarnings=%d",
+                totalCount,
+                successCount,
+                failedCount,
+                duplicateWarningCount,
+            )
+            return df
+
         workerCount = maxWorkers
         if workerCount is None:
             workerCount = min(4, max(1, len(orderedIndices)))
@@ -1004,6 +1051,8 @@ class TessDataDownloader:
                         }
                     for column, value in updates.items():
                         df.at[idx, column] = value
+                    # Save progress after each star
+                    df.to_parquet(augmentedPath, index=False)
             else:
                 with ThreadPoolExecutor(max_workers=workerCount) as executor:
                     futureToIdx = {
@@ -1048,6 +1097,8 @@ class TessDataDownloader:
 
                         for column, value in updates.items():
                             df.at[idx, column] = value
+                        # Save progress after each star
+                        df.to_parquet(augmentedPath, index=False)
         finally:
             self.lowSnrThreshold = originalLowSnrThreshold
             if cleanupDownloads:
