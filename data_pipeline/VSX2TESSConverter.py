@@ -1,6 +1,6 @@
 from astropy.coordinates import SkyCoord
 from astropy import units as u
-from astroquery.mast import Catalogs
+from astroquery.mast import Catalogs, Observations
 import logging
 
 class VSX2TESSConverter:
@@ -17,9 +17,13 @@ class VSX2TESSConverter:
     def __init__(self):
         self.logger = logging.getLogger("VSX2TESSConverter")
 
-    def crossmatchToTic(self, starRecord, radiusArcsec=5.0):
+    def crossmatchToTic(self, starRecord, radiusArcsec=5.0, maxMatches=5):
         """
         Crossmatch AAVSO VSX variable-star record to the TESS Input Catalog using RA/Dec.
+
+        The returned record includes a `ticCandidates` list containing up to
+        `maxMatches` candidates sorted by angular separation from the VSX target.
+        Each candidate has: ticId, ticRaDeg, ticDecDeg, ticTmag, ticDistanceArcmin.
 
         Returns
         -------
@@ -54,39 +58,51 @@ class VSX2TESSConverter:
 
         # TIC query results do not always provide a query-center "distance"
         # column, so compute angular separation explicitly from RA/Dec.
-        raColumnName = "ra" if "ra" in ticTable.colnames else None
-        decColumnName = "dec" if "dec" in ticTable.colnames else None
+        hasRa = "ra" in ticTable.colnames
+        hasDec = "dec" in ticTable.colnames
 
-        bestMatch = None
-        bestSeparationArcsec = None
-
-        if raColumnName is not None and decColumnName is not None:
+        ticCandidates = []
+        if hasRa and hasDec:
             for row in ticTable:
                 try:
+                    ticRaDeg = float(row["ra"])
+                    ticDecDeg = float(row["dec"])
+                    ticTmagRaw = row["Tmag"]
+                    try:
+                        ticTmag = float(ticTmagRaw)
+                    except Exception:
+                        ticTmag = None
+
+                    
                     ticCoord = SkyCoord(
-                        ra=float(row[raColumnName]) * u.deg,
-                        dec=float(row[decColumnName]) * u.deg,
-                        frame="icrs",
+                        ra=float(ticRaDeg) * u.deg,
+                        dec=float(ticDecDeg) * u.deg,
+                        frame="icrs"
                     )
-                    separationArcsec = coord.separation(ticCoord).arcsec
+                    separationArcsec = float(coord.separation(ticCoord).arcsec)
                 except Exception:
                     continue
 
-                if bestSeparationArcsec is None or separationArcsec < bestSeparationArcsec:
-                    bestSeparationArcsec = separationArcsec
-                    bestMatch = row
+                ticCandidates.append(
+                    {
+                        "ticId": str(row["ID"]),
+                        "ticRaDeg": ticRaDeg,
+                        "ticDecDeg": ticDecDeg,
+                        "ticTmag": ticTmag,
+                        "ticDistanceArcmin": separationArcsec / 60.0,
+                    }
+                )
 
-        if bestMatch is None:
-            bestMatch = ticTable[0]
+        if not ticCandidates:
+            return None
+
+        maxMatches = max(1, int(maxMatches))
+        #be sure to sort by ticDistanceArcmin
+        ticCandidates.sort(key=lambda candidate: candidate["ticDistanceArcmin"])
+        topCandidates = ticCandidates[:maxMatches]
 
         matchedRecord = dict(starRecord)
-        matchedRecord["ticId"] = bestMatch["ID"]
-        matchedRecord["ticRaDeg"] = bestMatch["ra"]
-        matchedRecord["ticDecDeg"] = bestMatch["dec"]
-        matchedRecord["ticTmag"] = bestMatch["Tmag"]
-        matchedRecord["ticDistanceArcmin"] = (
-            bestSeparationArcsec / 60.0 if bestSeparationArcsec is not None else None
-        )
+        matchedRecord["ticCandidates"] = topCandidates
         matchedRecord['VSXId'] = starRecord.get('VSXId')
         matchedRecord['VSXName'] = starRecord.get('VSXName')
         matchedRecord['VSXType'] = starRecord.get('VSXType')
@@ -109,50 +125,145 @@ class VSX2TESSConverter:
                 if (matchedRecord := self.crossmatchToTic(star, radiusArcsec=radiusArcsec)) is not None
             ]
 
+        self.findBestMatches(result)
+
         return result
+    
+    def findBestMatches(self, categoryDictionary, batchSize=200):
+        """
+        For each star, inspect TIC candidates in distance order and choose the first
+        one with an available TESS light curve, preferring SPOC over QLP.
+        Adds a 'bestMatch' field with {ticId, author}, or None if neither author exists.
+        """
+        def _normalize_tic(value):
+            if value is None:
+                return None
+            digits = "".join(ch for ch in str(value) if ch.isdigit())
+            if not digits:
+                return None
+            return str(int(digits))
+
+        def _chunked(items, chunkSize):
+            for idx in range(0, len(items), chunkSize):
+                yield items[idx : idx + chunkSize]
+
+        uniqueTicIds = sorted(
+            {
+                _normalize_tic(candidate.get("ticId"))
+                for stars in categoryDictionary.values()
+                for star in stars
+                for candidate in star.get("ticCandidates", [])
+                if _normalize_tic(candidate.get("ticId")) is not None
+            }
+        )
+
+        ticAvailability = {
+            ticId: {"SPOC": False, "QLP": False}
+            for ticId in uniqueTicIds
+        }
+
+        batchSize = max(1, int(batchSize))
+        for ticBatch in _chunked(uniqueTicIds, batchSize):
+            try:
+                observations = Observations.query_criteria(
+                    project=["TESS"],
+                    provenance_name=["SPOC", "QLP"],
+                    dataproduct_type=["timeseries", "cube"],
+                    target_name=[ticId.zfill(9) for ticId in ticBatch],
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "Availability query failed for TIC batch of size %d: %s",
+                    len(ticBatch),
+                    exc,
+                )
+                continue
+
+            if observations is None:
+                continue
+
+            for row in observations:
+                ticId = _normalize_tic(row.get("target_name"))
+                author = str(row.get("provenance_name", "")).strip().upper()
+                if ticId not in ticAvailability or author not in {"SPOC", "QLP"}:
+                    continue
+                ticAvailability[ticId][author] = True
+
+        for family, stars in categoryDictionary.items():
+            for star in stars:
+                ticCandidates = star.get("ticCandidates", [])
+                star["bestMatch"] = None
+
+                for candidate in ticCandidates:
+                    ticId = _normalize_tic(candidate.get("ticId"))
+                    if ticId is None:
+                        continue
+
+                    availability = ticAvailability.get(ticId, {"SPOC": False, "QLP": False})
+
+                    if availability.get("SPOC"):
+                        star["bestMatch"] = {
+                            "ticId": ticId,
+                            "author": "SPOC",
+                        }
+                        break
+
+                    if availability.get("QLP"):
+                        star["bestMatch"] = {
+                            "ticId": ticId,
+                            "author": "QLP",
+                        }
+                        break
     
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     converter = VSX2TESSConverter()
-    # Example usage:
 
-    #check RR Lyr
-    starRecord = {"raDeg": 291.36629, "decDeg":  42.78436, "VSXName": ""}
-    tessRecord = converter.crossmatchToTic(starRecord)
-    if tessRecord['ticId'] != '159717514':
-        converter.logger.error("RR Lyrae crossmatch failed: expected TIC ID 159717514, got %s", tessRecord['ticId'])
-    else:
-        converter.logger.info("RR Lyr crossmatch succeeded: TIC ID %s", tessRecord['ticId'])
+    def _check_crossmatch(starRecord, expectedTicId, label):
+        tessRecord = converter.crossmatchToTic(starRecord)
+        if tessRecord is None:
+            converter.logger.error("%s crossmatch failed: no TIC candidates returned", label)
+            return
 
-    #check TV Boo 
-    starRecord = {"raDeg": 214.15242, "decDeg": 42.35992, "VSXName": ""}
-    tessRecord = converter.crossmatchToTic(starRecord)
-    if tessRecord['ticId'] != '168709463':
-        logger.error("TV Boo crossmatch failed: expected TIC ID 168709463, got %s", tessRecord['ticId'])
-    else:
-        logger.info("TV Boo crossmatch succeeded: TIC ID %s", tessRecord['ticId'])
+        ticCandidates = tessRecord.get("ticCandidates", [])
+        if not ticCandidates:
+            converter.logger.error("%s crossmatch failed: empty ticCandidates", label)
+            return
 
-    #check V1334 Cyg
-    starRecord = {"raDeg": 319.84242, "decDeg": 38.23747, "VSXName": ""}
-    tessRecord = converter.crossmatchToTic(starRecord)
-    if tessRecord['ticId'] != '373202340':
-        logger.error("V1334 Cyg crossmatch failed: expected TIC ID 373202340, got %s", tessRecord['ticId'])
-    else:
-        logger.info("V1334 Cyg crossmatch succeeded: TIC ID %s", tessRecord['ticId'])
+        bestTicId = str(ticCandidates[0].get("ticId"))
+        if bestTicId != str(expectedTicId):
+            converter.logger.error(
+                "%s crossmatch failed: expected TIC ID %s, got %s",
+                label,
+                expectedTicId,
+                bestTicId,
+            )
+        else:
+            converter.logger.info("%s crossmatch succeeded: TIC ID %s", label, bestTicId)
 
-    #check TT Lyn
-    starRecord = {"raDeg": 135.78246, "decDeg":  44.58558, "VSXName": ""}
-    tessRecord = converter.crossmatchToTic(starRecord)
-    if tessRecord['ticId'] != '29172806':
-        logger.error("TT Lyn crossmatch failed: expected TIC ID 29172806, got %s", tessRecord['ticId'])
-    else:
-        logger.info("TT Lyn crossmatch succeeded: TIC ID %s", tessRecord['ticId'])
-
-    #check AU Peg
-    starRecord = {"raDeg": 321.00100, "decDeg":  18.27883, "VSXName": ""}
-    tessRecord = converter.crossmatchToTic(starRecord)
-    if tessRecord['ticId'] != '279587090':
-        logger.error("AU Peg crossmatch failed: expected TIC ID 279587090, got %s", tessRecord['ticId'])
-    else:
-        logger.info("AU Peg crossmatch succeeded: TIC ID %s", tessRecord['ticId'])
+    _check_crossmatch(
+        {"raDeg": 291.36629, "decDeg": 42.78436, "VSXName": ""},
+        "159717514",
+        "RR Lyr",
+    )
+    _check_crossmatch(
+        {"raDeg": 214.15242, "decDeg": 42.35992, "VSXName": ""},
+        "168709463",
+        "TV Boo",
+    )
+    _check_crossmatch(
+        {"raDeg": 319.84242, "decDeg": 38.23747, "VSXName": ""},
+        "373202340",
+        "V1334 Cyg",
+    )
+    _check_crossmatch(
+        {"raDeg": 135.78246, "decDeg": 44.58558, "VSXName": ""},
+        "29172806",
+        "TT Lyn",
+    )
+    _check_crossmatch(
+        {"raDeg": 321.00100, "decDeg": 18.27883, "VSXName": ""},
+        "279587090",
+        "AU Peg",
+    )
