@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
+import pandas as pd
 from astropy.io import fits
 
 
@@ -244,6 +245,129 @@ def print_summary(results: List[ScanResult]) -> None:
                 print(f"  verdict={r.verdict}, size={r.size_bytes} bytes, issues={r.issues}")
 
 
+def determine_qc_status(scan_result: ScanResult) -> Tuple[str, str]:
+    """
+    Determine QC status based on scan results.
+    
+    Returns:
+        Tuple[str, str]: (status, details) where status is "pass", "warning", or "fail"
+    """
+    issues = []
+    status = "pass"
+    
+    # Hard fail conditions
+    if scan_result.finite_rows is not None and scan_result.finite_rows < 100:
+        issues.append("too_few_finite_rows")
+        status = "fail"
+    
+    if scan_result.finite_fraction is not None and scan_result.finite_fraction < 0.50:
+        issues.append("low_finite_fraction")
+        status = "fail"
+    
+    # Soft warning conditions (only if not already failed)
+    if status != "fail":
+        warning_flags = []
+        
+        if scan_result.finite_fraction is not None and 0.50 <= scan_result.finite_fraction < 0.75:
+            warning_flags.append("marginal_finite_fraction")
+        
+        if scan_result.finite_rows is not None and 100 <= scan_result.finite_rows < 300:
+            warning_flags.append("marginal_row_count")
+        
+        if scan_result.size_bytes < 50 * 1024:  # 50 KB
+            warning_flags.append("small_file")
+        
+        # Warn if any soft conditions are met
+        if len(warning_flags) > 0:
+            status = "warning"
+            issues.extend(warning_flags)
+    
+    # Check for hard failure indicators
+    if scan_result.verdict == "FAILED_TO_OPEN":
+        status = "fail"
+        issues.append("failed_to_open")
+    
+    if scan_result.verdict == "UNCLEAR_OR_METADATA_ONLY":
+        if not scan_result.has_time_flux_table:
+            status = "fail"
+            issues.append("no_time_flux_table")
+    
+    details = ";".join(issues) if issues else "all_checks_passed"
+    return status, details
+
+
+def process_augmented_parquet(folder: Path) -> None:
+    """
+    Process TESSAugmented.parquet: scan associated FITS files and add QC columns.
+    """
+    parquet_path = folder / "TESSAugmented.parquet"
+    output_path = folder / "TESSAugmented_QC.parquet"
+    
+    if not parquet_path.exists():
+        print(f"Parquet file not found: {parquet_path}")
+        return
+    
+    print(f"Loading {parquet_path}...")
+    df = pd.read_parquet(parquet_path)
+    
+    # Add QC columns
+    df["fitsQcStatus"] = "unknown"
+    df["fitsQcReason"] = ""
+    
+    print(f"Processing {len(df)} rows for FITS QC...")
+    
+    for idx, row in df.iterrows():
+        if idx % 100 == 0:
+            print(f"  Processing row {idx}/{len(df)}...")
+        
+        # Get light curve paths
+        lc_path = row.get("lightCurvePath")
+        raw_path = row.get("rawLightCurvePath")
+        
+        # Skip if no paths or both missing
+        if pd.isna(lc_path) or not lc_path:
+            df.at[idx, "fitsQcStatus"] = "unknown"
+            df.at[idx, "fitsQcReason"] = "no_light_curve_path"
+            continue
+        
+        # Check if files exist
+        lc_file = Path(lc_path)
+        if not lc_file.exists():
+            df.at[idx, "fitsQcStatus"] = "fail"
+            df.at[idx, "fitsQcReason"] = "light_curve_file_missing"
+            continue
+        
+        # Scan the light curve file
+        scan_result = classify_and_flag(
+            lc_file,
+            min_size_kb=50,
+            min_finite_rows=100,
+            min_finite_fraction=0.50,
+        )
+        
+        # Determine QC status
+        status, details = determine_qc_status(scan_result)
+        df.at[idx, "fitsQcStatus"] = status
+        df.at[idx, "fitsQcReason"] = details
+    
+    # Save to new parquet
+    df.to_parquet(output_path, index=False)
+    print(f"\nQC results written to: {output_path}")
+    
+    # Print summary
+    pass_count = (df["fitsQcStatus"] == "pass").sum()
+    warning_count = (df["fitsQcStatus"] == "warning").sum()
+    fail_count = (df["fitsQcStatus"] == "fail").sum()
+    unknown_count = (df["fitsQcStatus"] == "unknown").sum()
+    
+    print(f"\nQC Summary:")
+    print(f"  Pass:    {pass_count}")
+    print(f"  Warning: {warning_count}")
+    print(f"  Fail:    {fail_count}")
+    print(f"  Unknown: {unknown_count}")
+    print(f"  Total:   {len(df)}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Scan a folder recursively and flag suspicious FITS files.")
     parser.add_argument("folder", help="Folder to scan recursively")
@@ -269,6 +393,12 @@ def main():
         csv_path = Path(args.csv_path)
         write_csv(results, csv_path)
         print(f"\nCSV report written to: {csv_path}")
+    
+    # Process TESSAugmented.parquet if it exists
+    print("\n" + "="*80)
+    print("Processing TESSAugmented.parquet for QC...")
+    print("="*80)
+    process_augmented_parquet(folder)
 
 
 if __name__ == "__main__":
