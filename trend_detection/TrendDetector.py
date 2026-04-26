@@ -32,6 +32,8 @@ DEFAULT_LOW_FREQ_PERIOD_MAX_FACTOR: float = 2.0   # period = factor * baseline
 DEFAULT_REF_FREQ_MIN_FACTOR: float = 1.5          # refFreqMin = factor * lowFreqMax
 DEFAULT_DEBUG_SAMPLE_COUNT: int = 5
 TREND_METHOD: str = "ls_segmented_low_frequency_power_v1"
+DEFAULT_SEGMENT_DRIFT_STRENGTH_THRESHOLD: float = 2.5
+DRIFT_METHOD: str = "segment_wise_linear_drift_mad_v1"
 # ---------------------------------------------------------------------------
 
 
@@ -70,6 +72,30 @@ class TrendDetector:
             "lsLowFreqMax": np.nan,
             "lsRefFreqMin": np.nan,
             "lsRefFreqMax": np.nan,
+        }
+
+    def _empty_drift_result(
+        self,
+        status: str,
+        driftStrengthThreshold: float,
+        numFinitePoints: int = 0,
+        gapThresholdDays: float = DEFAULT_GAP_THRESHOLD_DAYS,
+        minSegmentPoints: int = DEFAULT_MIN_SEGMENT_POINTS,
+        minSegmentDuration: float = DEFAULT_MIN_SEGMENT_DURATION_DAYS,
+    ) -> Dict:
+        return {
+            "robustDriftDetected": False,
+            "robustDriftStatus": status,
+            "robustDriftMethod": DRIFT_METHOD,
+            "robustDriftThreshold": driftStrengthThreshold,
+            "robustValidSegmentCount": 0,
+            "robustSegmentDriftCount": 0,
+            "robustFractionSegmentsWithDrift": np.nan,
+            "robustMaxSegmentDriftStrength": np.nan,
+            "robustMedianSegmentDriftStrength": np.nan,
+            "robustMinSegmentDurationDays": minSegmentDuration,
+            "robustMinSegmentPoints": minSegmentPoints,
+            "robustGapThresholdDays": gapThresholdDays,
         }
 
     def _split_into_segments(
@@ -153,6 +179,58 @@ class TrendDetector:
             "segmentRefMedianPower": ref_median_power,
             "segmentLowFreqPowerRatio": float(low_freq_power_ratio),
             "segmentHasLowFreqPower": low_freq_power_ratio >= lowFreqPowerRatioThreshold,
+        }
+
+    def _analyze_segment_drift(
+        self,
+        segmentTime: np.ndarray,
+        segmentFlux: np.ndarray,
+        driftStrengthThreshold: float,
+        minSegmentPoints: int,
+        minSegmentDuration: float,
+    ) -> Optional[Dict]:
+        """
+        Fit a linear trend to one contiguous segment and compute drift strength.
+
+        segmentDriftStrength = abs(slope * segmentDuration) / (1.4826 * MAD)
+
+        Returns None if the segment is too short, too few points, or has zero scatter.
+        """
+        num_points = len(segmentTime)
+        if num_points < minSegmentPoints:
+            return None
+
+        segment_duration = float(segmentTime[-1] - segmentTime[0])
+        if segment_duration < minSegmentDuration:
+            return None
+
+        # Robust scatter via MAD
+        median_flux = float(np.median(segmentFlux))
+        mad = float(np.median(np.abs(segmentFlux - median_flux)))
+        robust_scatter = 1.4826 * mad
+        if not np.isfinite(robust_scatter) or robust_scatter <= 0.0:
+            return None  # zero or degenerate scatter – skip segment
+
+        # Center time for numerical stability before polyfit
+        t_centered = segmentTime - np.median(segmentTime)
+        try:
+            slope, _intercept = np.polyfit(t_centered, segmentFlux, 1)
+        except Exception:
+            return None
+
+        drift = abs(float(slope) * segment_duration)
+        drift_strength = drift / robust_scatter
+        if not np.isfinite(drift_strength):
+            return None
+
+        return {
+            "segmentDuration": segment_duration,
+            "segmentNumPoints": num_points,
+            "segmentSlope": float(slope),
+            "segmentDrift": float(drift),
+            "segmentRobustScatter": float(robust_scatter),
+            "segmentDriftStrength": float(drift_strength),
+            "segmentHasDrift": drift_strength >= driftStrengthThreshold,
         }
 
     def _load_time_flux_from_raw_fits(self, rawFitsPath: str) -> Tuple[np.ndarray, np.ndarray]:
@@ -304,6 +382,126 @@ class TrendDetector:
                 lowFreqPowerRatioThreshold=lowFreqPowerRatioThreshold,
             )
 
+    def detectRobustDrift(
+        self,
+        rawFitsPath: str,
+        minFinitePoints: int = DEFAULT_MIN_FINITE_POINTS,
+        driftStrengthThreshold: float = DEFAULT_SEGMENT_DRIFT_STRENGTH_THRESHOLD,
+        gapThresholdDays: float = DEFAULT_GAP_THRESHOLD_DAYS,
+        minSegmentPoints: int = DEFAULT_MIN_SEGMENT_POINTS,
+        minSegmentDuration: float = DEFAULT_MIN_SEGMENT_DURATION_DAYS,
+    ) -> Dict:
+        """
+        Detect slow drift within each contiguous observing segment.
+
+        For each segment, computes:
+            segmentDriftStrength = abs(slope * segmentDuration) / (1.4826 * MAD)
+
+        Star-level flag uses fraction of segments with drift >= 0.5 OR median
+        drift strength >= threshold.  The max alone is NOT used so that one
+        anomalous segment cannot flag the whole light curve.
+
+        Args:
+            rawFitsPath: Path to the pipeline-generated raw FITS file
+            minFinitePoints: Minimum number of finite TIME/FLUX points required
+            driftStrengthThreshold: Drift-strength threshold for per-segment flag
+            gapThresholdDays: Start a new segment when time gaps exceed this value
+            minSegmentPoints: Minimum points required for a valid segment
+            minSegmentDuration: Minimum duration in days required for a valid segment
+
+        Returns:
+            Drift metadata dictionary for one stitched light curve.
+        """
+        def _empty(status: str, n: int = 0) -> Dict:
+            return self._empty_drift_result(
+                status=status,
+                driftStrengthThreshold=driftStrengthThreshold,
+                numFinitePoints=n,
+                gapThresholdDays=gapThresholdDays,
+                minSegmentPoints=minSegmentPoints,
+                minSegmentDuration=minSegmentDuration,
+            )
+
+        try:
+            time, flux = self._load_time_flux_from_raw_fits(rawFitsPath)
+
+            finite_mask = np.isfinite(time) & np.isfinite(flux)
+            time_finite = time[finite_mask]
+            flux_finite = flux[finite_mask]
+
+            if len(time_finite) == 0:
+                return _empty("insufficient_data")
+
+            sort_idx = np.argsort(time_finite)
+            time_finite = time_finite[sort_idx]
+            flux_finite = flux_finite[sort_idx]
+            num_finite = len(time_finite)
+
+            if num_finite < minFinitePoints:
+                return _empty("insufficient_data", num_finite)
+
+            segments = self._split_into_segments(time_finite, flux_finite, gapThresholdDays)
+
+            valid_segments: List[Dict] = []
+            for seg_time, seg_flux in segments:
+                seg_result = self._analyze_segment_drift(
+                    segmentTime=seg_time,
+                    segmentFlux=seg_flux,
+                    driftStrengthThreshold=driftStrengthThreshold,
+                    minSegmentPoints=minSegmentPoints,
+                    minSegmentDuration=minSegmentDuration,
+                )
+                if seg_result is not None:
+                    valid_segments.append(seg_result)
+
+            valid_segment_count = len(valid_segments)
+            if valid_segment_count == 0:
+                return _empty("insufficient_data", num_finite)
+
+            drift_count = int(sum(1 for s in valid_segments if s["segmentHasDrift"]))
+            strengths = [s["segmentDriftStrength"] for s in valid_segments]
+            max_strength = float(np.max(strengths))
+            median_strength = float(np.median(strengths))
+            fraction_with_drift = drift_count / valid_segment_count
+
+            # Star-level flag: fraction >= 0.5 OR median >= threshold.
+            # Max alone is intentionally NOT used.
+            drift_detected = (
+                fraction_with_drift >= 0.5
+                or median_strength >= driftStrengthThreshold
+            )
+            status = "drift" if drift_detected else "no_drift"
+
+            self.logger.info(
+                "Drift summary: valid_segs=%d drift_segs=%d fraction=%.3f "
+                "max_strength=%.3f median_strength=%.3f detected=%s",
+                valid_segment_count,
+                drift_count,
+                fraction_with_drift,
+                max_strength,
+                median_strength,
+                drift_detected,
+            )
+
+            return {
+                "robustDriftDetected": drift_detected,
+                "robustDriftStatus": status,
+                "robustDriftMethod": DRIFT_METHOD,
+                "robustDriftThreshold": driftStrengthThreshold,
+                "robustValidSegmentCount": valid_segment_count,
+                "robustSegmentDriftCount": drift_count,
+                "robustFractionSegmentsWithDrift": float(fraction_with_drift),
+                "robustMaxSegmentDriftStrength": max_strength,
+                "robustMedianSegmentDriftStrength": median_strength,
+                "robustMinSegmentDurationDays": minSegmentDuration,
+                "robustMinSegmentPoints": minSegmentPoints,
+                "robustGapThresholdDays": gapThresholdDays,
+            }
+
+        except Exception as e:
+            self.logger.exception(f"Robust drift detection failed for {rawFitsPath}: {e}")
+            return _empty("failed")
+
     def _process_single_row(
         self,
         idx: int,
@@ -313,22 +511,25 @@ class TrendDetector:
         minSegmentPoints: int,
         minSegmentDuration: float,
         lowFreqPowerRatioThreshold: float,
+        driftStrengthThreshold: float,
     ) -> Tuple[int, dict]:
         """
-        Process a single row for trend detection.
-
-        Args:
-            idx: Row index
-            row: Row data
-            fits_folder: Path to FITS folder
-
-        Returns:
-            Tuple of (idx, results_dict) using the v2 field names
+        Process a single row: run both LS low-frequency detection and robust
+        segment-wise drift detection, then return merged results.
         """
-        _failed: dict = self._empty_segmented_result(
-            status="failed",
-            lowFreqPowerRatioThreshold=lowFreqPowerRatioThreshold,
-        )
+        _failed: dict = {
+            **self._empty_segmented_result(
+                status="failed",
+                lowFreqPowerRatioThreshold=lowFreqPowerRatioThreshold,
+            ),
+            **self._empty_drift_result(
+                status="failed",
+                driftStrengthThreshold=driftStrengthThreshold,
+                gapThresholdDays=gapThresholdDays,
+                minSegmentPoints=minSegmentPoints,
+                minSegmentDuration=minSegmentDuration,
+            ),
+        }
 
         # Extract VSX ID to find raw FITS file
         vsx_id = row.get("VSXId")
@@ -347,15 +548,25 @@ class TrendDetector:
         raw_fits_path = str(raw_fits_files[0])
         self.logger.debug(f"Row {idx} ({vsx_id}): Found raw FITS file: {raw_fits_path}")
 
-        # Run trend detection
-        trend_result = self.detectLongTermTrendWithLS(
+        # Run LS low-frequency trend detection (retained for diagnostics)
+        ls_result = self.detectLongTermTrendWithLS(
             rawFitsPath=raw_fits_path,
             lowFreqPowerRatioThreshold=lowFreqPowerRatioThreshold,
             gapThresholdDays=gapThresholdDays,
             minSegmentPoints=minSegmentPoints,
             minSegmentDuration=minSegmentDuration,
         )
-        return idx, trend_result
+
+        # Run segment-wise robust drift detection
+        drift_result = self.detectRobustDrift(
+            rawFitsPath=raw_fits_path,
+            driftStrengthThreshold=driftStrengthThreshold,
+            gapThresholdDays=gapThresholdDays,
+            minSegmentPoints=minSegmentPoints,
+            minSegmentDuration=minSegmentDuration,
+        )
+
+        return idx, {**ls_result, **drift_result}
 
     def run(
         self,
@@ -367,10 +578,11 @@ class TrendDetector:
         minSegmentPoints: int = DEFAULT_MIN_SEGMENT_POINTS,
         minSegmentDuration: float = DEFAULT_MIN_SEGMENT_DURATION_DAYS,
         lowFreqPowerRatioThreshold: float = DEFAULT_LOW_FREQ_POWER_RATIO_THRESHOLD,
+        driftStrengthThreshold: float = DEFAULT_SEGMENT_DRIFT_STRENGTH_THRESHOLD,
     ) -> str:
         """
-        Process a metadata parquet file and run low-frequency trend detection on
-        associated raw FITS files using a thread pool.
+        Process a metadata parquet file and run both LS low-frequency detection
+        and segment-wise robust drift detection on associated raw FITS files.
 
         Args:
             metaParquetFile: Path to the metadata parquet file
@@ -380,10 +592,11 @@ class TrendDetector:
             gapThresholdDays: Split stitched light curves into segments on gaps > this many days
             minSegmentPoints: Minimum points required in a valid segment
             minSegmentDuration: Minimum duration in days required in a valid segment
-            lowFreqPowerRatioThreshold: Ratio threshold applied to each segment
+            lowFreqPowerRatioThreshold: LS ratio threshold per segment (diagnostics)
+            driftStrengthThreshold: Drift-strength threshold for per-segment drift flag
 
         Returns:
-            Path to the output parquet file with trend detection results
+            Path to the output parquet file with trend/drift detection results
         """
         # Load metadata parquet
         self.logger.info(f"Loading metadata from {metaParquetFile}")
@@ -416,12 +629,31 @@ class TrendDetector:
             if col not in df.columns:
                 df[col] = None
 
+        # Ensure all drift result columns exist
+        drift_columns = [
+            "robustDriftDetected",
+            "robustDriftStatus",
+            "robustDriftMethod",
+            "robustDriftThreshold",
+            "robustValidSegmentCount",
+            "robustSegmentDriftCount",
+            "robustFractionSegmentsWithDrift",
+            "robustMaxSegmentDriftStrength",
+            "robustMedianSegmentDriftStrength",
+            "robustMinSegmentDurationDays",
+            "robustMinSegmentPoints",
+            "robustGapThresholdDays",
+        ]
+        for col in drift_columns:
+            if col not in df.columns:
+                df[col] = None
+
         fits_folder = Path(fitsFolder)
         if not fits_folder.exists() or not fits_folder.is_dir():
             self.logger.error(f"FITS folder not found or not a directory: {fitsFolder}")
             raise ValueError(f"Invalid FITS folder: {fitsFolder}")
 
-        # Counters
+        # LS counters
         processed_count = 0
         low_freq_count = 0
         no_low_freq_count = 0
@@ -429,12 +661,23 @@ class TrendDetector:
         failed_count = 0
         stars_with_valid_segments = 0
         segment_count_distribution: Dict[int, int] = {}
+        # Drift counters
+        drift_detected_count = 0
+        no_drift_count = 0
+        drift_insufficient_count = 0
+        drift_failed_count = 0
         total = len(df)
 
         self.logger.info(
-            f"Starting low-frequency trend detection with {maxWorkers} worker threads "
-            f"(ratio threshold={lowFreqPowerRatioThreshold}, gap={gapThresholdDays}d, "
-            f"minSegmentPoints={minSegmentPoints}, minSegmentDuration={minSegmentDuration}d)"
+            "Starting trend/drift detection with %d worker threads "
+            "(ls_ratio_threshold=%.1f, drift_threshold=%.2f, gap=%.1fd, "
+            "minSegmentPoints=%d, minSegmentDuration=%.1fd)",
+            maxWorkers,
+            lowFreqPowerRatioThreshold,
+            driftStrengthThreshold,
+            gapThresholdDays,
+            minSegmentPoints,
+            minSegmentDuration,
         )
 
         with ThreadPoolExecutor(max_workers=maxWorkers) as executor:
@@ -448,6 +691,7 @@ class TrendDetector:
                     minSegmentPoints,
                     minSegmentDuration,
                     lowFreqPowerRatioThreshold,
+                    driftStrengthThreshold,
                 ): idx
                 for idx in df.index
             }
@@ -461,29 +705,45 @@ class TrendDetector:
                         df.at[result_idx, col] = val
 
                     processed_count += 1
-                    status = result_data["lsTrendStatus"]
+
+                    # LS counters
+                    ls_status = result_data.get("lsTrendStatus", "failed")
                     valid_segment_count = int(result_data.get("lsValidSegmentCount", 0) or 0)
                     if valid_segment_count > 0:
                         stars_with_valid_segments += 1
                     segment_count_distribution[valid_segment_count] = (
                         segment_count_distribution.get(valid_segment_count, 0) + 1
                     )
-
-                    if status == "low_frequency_power":
+                    if ls_status == "low_frequency_power":
                         low_freq_count += 1
-                    elif status == "no_low_frequency_power":
+                    elif ls_status == "no_low_frequency_power":
                         no_low_freq_count += 1
-                    elif status == "insufficient_data":
+                    elif ls_status == "insufficient_data":
                         insufficient_count += 1
                     else:
                         failed_count += 1
 
+                    # Drift counters
+                    drift_status = result_data.get("robustDriftStatus", "failed")
+                    if drift_status == "drift":
+                        drift_detected_count += 1
+                    elif drift_status == "no_drift":
+                        no_drift_count += 1
+                    elif drift_status == "insufficient_data":
+                        drift_insufficient_count += 1
+                    else:
+                        drift_failed_count += 1
+
                     if processed_count % 100 == 0:
                         self.logger.info(
-                            f"Progress: {processed_count}/{total} processed "
-                            f"| low_freq={low_freq_count} no_low_freq={no_low_freq_count} "
-                            f"| valid_segments>0={stars_with_valid_segments} "
-                            f"| insufficient={insufficient_count} failed={failed_count}"
+                            "Progress: %d/%d | ls_low_freq=%d no_ls=%d "
+                            "| drift=%d no_drift=%d "
+                            "| ls_insuf=%d drift_insuf=%d ls_fail=%d drift_fail=%d",
+                            processed_count, total,
+                            low_freq_count, no_low_freq_count,
+                            drift_detected_count, no_drift_count,
+                            insufficient_count, drift_insufficient_count,
+                            failed_count, drift_failed_count,
                         )
 
                 except Exception as e:
@@ -503,22 +763,33 @@ class TrendDetector:
         # Summary logging
         pct = lambda n: f"{100 * n / processed_count:.1f}%" if processed_count else "N/A"
         self.logger.info("=" * 60)
-        self.logger.info("Low-Frequency Trend Detection Summary")
-        self.logger.info(f"  Total rows in parquet : {total}")
-        self.logger.info(f"  Processed             : {processed_count}")
-        self.logger.info(f"  >=1 valid segment     : {stars_with_valid_segments}  ({pct(stars_with_valid_segments)})")
-        self.logger.info(f"  Low-freq detected     : {low_freq_count}  ({pct(low_freq_count)})")
-        self.logger.info(f"  No low-freq           : {no_low_freq_count}  ({pct(no_low_freq_count)})")
-        self.logger.info(f"  Insufficient data     : {insufficient_count}  ({pct(insufficient_count)})")
-        self.logger.info(f"  Failed                : {failed_count}  ({pct(failed_count)})")
+        self.logger.info("Trend/Drift Detection Run Summary")
+        self.logger.info("  Total rows in parquet : %d", total)
+        self.logger.info("  Processed             : %d", processed_count)
+        self.logger.info("")
+        self.logger.info("  ── LS Low-Frequency (diagnostics) ─────────────────────────")
+        self.logger.info("  >=1 valid segment     : %d  (%s)", stars_with_valid_segments, pct(stars_with_valid_segments))
+        self.logger.info("  Low-freq detected     : %d  (%s)", low_freq_count, pct(low_freq_count))
+        self.logger.info("  No low-freq           : %d  (%s)", no_low_freq_count, pct(no_low_freq_count))
+        self.logger.info("  Insufficient data     : %d  (%s)", insufficient_count, pct(insufficient_count))
+        self.logger.info("  Failed                : %d  (%s)", failed_count, pct(failed_count))
         self.logger.info("  Segment count distribution:")
         for segment_count in sorted(segment_count_distribution):
             self.logger.info(
-                f"    segments={segment_count}: {segment_count_distribution[segment_count]} stars"
+                "    segments=%d: %d stars",
+                segment_count,
+                segment_count_distribution[segment_count],
             )
+        self.logger.info("")
+        self.logger.info("  ── Robust Drift ─────────────────────────────────────────────")
+        self.logger.info("  Drift detected        : %d  (%s)", drift_detected_count, pct(drift_detected_count))
+        self.logger.info("  No drift              : %d  (%s)", no_drift_count, pct(no_drift_count))
+        self.logger.info("  Insufficient data     : %d  (%s)", drift_insufficient_count, pct(drift_insufficient_count))
+        self.logger.info("  Failed                : %d  (%s)", drift_failed_count, pct(drift_failed_count))
         self.logger.info("=" * 60)
 
         self.summarize_outputs(output_path, output_dir)
+        self.summarize_drift_outputs(output_path, output_dir)
 
         return str(output_path)
 
@@ -602,6 +873,134 @@ class TrendDetector:
     def summarize_by_family(self, trendParquetFile: str, outputDir: Optional[str] = None) -> str:
         return self.summarize_outputs(trendParquetFile, outputDir)["family"]
 
+    def _build_drift_summary_df(self, df: pd.DataFrame, groupColumn: str) -> pd.DataFrame:
+        working_df = df.copy()
+        if groupColumn not in working_df.columns:
+            self.logger.warning("Column '%s' not found – using 'unknown'", groupColumn)
+            working_df[groupColumn] = "unknown"
+
+        working_df[groupColumn] = working_df[groupColumn].fillna("unknown")
+        rows = []
+        for group_value, grp in working_df.groupby(groupColumn, sort=True):
+            total_count = len(grp)
+            drift_detected = grp["robustDriftDetected"].fillna(False).astype(bool)
+            drift_count = int(drift_detected.sum())
+            drift_percent = round(100.0 * drift_count / total_count, 2) if total_count else 0.0
+
+            strengths = grp["robustMedianSegmentDriftStrength"].dropna()
+            median_drift_strength = float(strengths.median()) if len(strengths) > 0 else np.nan
+            p75_drift_strength = float(strengths.quantile(0.75)) if len(strengths) > 0 else np.nan
+            p90_drift_strength = float(strengths.quantile(0.90)) if len(strengths) > 0 else np.nan
+
+            status_col = grp["robustDriftStatus"].fillna("unknown")
+            insufficient_data_count = int((status_col == "insufficient_data").sum())
+            failed_count_grp = int((status_col == "failed").sum())
+
+            rows.append(
+                {
+                    groupColumn: group_value,
+                    "total_count": total_count,
+                    "drift_count": drift_count,
+                    "drift_percent": drift_percent,
+                    "median_drift_strength": median_drift_strength,
+                    "p75_drift_strength": p75_drift_strength,
+                    "p90_drift_strength": p90_drift_strength,
+                    "insufficient_data_count": insufficient_data_count,
+                    "failed_count": failed_count_grp,
+                }
+            )
+
+        return pd.DataFrame(rows)
+
+    def summarize_drift_outputs(
+        self, trendParquetFile: str, outputDir: Optional[str] = None
+    ) -> Dict[str, str]:
+        """
+        Read a trend-result parquet file and compute per-family and per-source
+        robust drift summaries.
+
+        Saves CSV and parquet files to outputDir (or alongside the input parquet).
+
+        Returns:
+            Dictionary of output file paths keyed by family_csv, family_parquet,
+            source_csv, source_parquet.
+        """
+        self.logger.info("Loading trend parquet for drift summaries: %s", trendParquetFile)
+        df = pd.read_parquet(trendParquetFile)
+        out_dir = Path(outputDir) if outputDir else Path(trendParquetFile).parent
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        # Family summary (all columns including insufficient_data_count, failed_count)
+        family_summary_df = self._build_drift_summary_df(df, "family")
+        family_csv_path = out_dir / "robust_drift_family_summary.csv"
+        family_parquet_path = out_dir / "robust_drift_family_summary.parquet"
+        family_summary_df.to_csv(family_csv_path, index=False)
+        family_summary_df.to_parquet(family_parquet_path, index=False)
+
+        # Source summary (without insufficient_data_count and failed_count per spec)
+        source_summary_df = self._build_drift_summary_df(df, "provenance")
+        source_summary_df = source_summary_df.drop(
+            columns=["insufficient_data_count", "failed_count"], errors="ignore"
+        )
+        source_csv_path = out_dir / "robust_drift_source_summary.csv"
+        source_parquet_path = out_dir / "robust_drift_source_summary.parquet"
+        source_summary_df.to_csv(source_csv_path, index=False)
+        source_summary_df.to_parquet(source_parquet_path, index=False)
+
+        self.logger.info("Drift family summary saved to %s", family_csv_path)
+        self.logger.info("Drift source summary saved to %s", source_csv_path)
+
+        # Log family table
+        self.logger.info("=" * 80)
+        self.logger.info("Family-Level Robust Drift Summary")
+        self.logger.info(
+            "%-30s %7s %7s %7s %12s %8s %8s %8s %7s",
+            "Family", "Total", "Drift", "Drift%",
+            "MedStrength", "P75", "P90", "InsSuff", "Failed",
+        )
+        self.logger.info("-" * 80)
+        for _, row in family_summary_df.iterrows():
+            self.logger.info(
+                "%-30s %7d %7d %6.1f%% %12.3f %8.3f %8.3f %8d %7d",
+                str(row["family"]),
+                int(row["total_count"]),
+                int(row["drift_count"]),
+                float(row["drift_percent"]),
+                float(row["median_drift_strength"]) if pd.notna(row["median_drift_strength"]) else float("nan"),
+                float(row["p75_drift_strength"]) if pd.notna(row["p75_drift_strength"]) else float("nan"),
+                float(row["p90_drift_strength"]) if pd.notna(row["p90_drift_strength"]) else float("nan"),
+                int(row["insufficient_data_count"]),
+                int(row["failed_count"]),
+            )
+
+        # Log source table
+        self.logger.info("-" * 80)
+        self.logger.info("Source-Level Robust Drift Summary")
+        self.logger.info(
+            "%-30s %7s %7s %7s %12s %8s %8s",
+            "Source", "Total", "Drift", "Drift%", "MedStrength", "P75", "P90",
+        )
+        self.logger.info("-" * 80)
+        for _, row in source_summary_df.iterrows():
+            self.logger.info(
+                "%-30s %7d %7d %6.1f%% %12.3f %8.3f %8.3f",
+                str(row["provenance"]),
+                int(row["total_count"]),
+                int(row["drift_count"]),
+                float(row["drift_percent"]),
+                float(row["median_drift_strength"]) if pd.notna(row["median_drift_strength"]) else float("nan"),
+                float(row["p75_drift_strength"]) if pd.notna(row["p75_drift_strength"]) else float("nan"),
+                float(row["p90_drift_strength"]) if pd.notna(row["p90_drift_strength"]) else float("nan"),
+            )
+        self.logger.info("=" * 80)
+
+        return {
+            "family_csv": str(family_csv_path),
+            "family_parquet": str(family_parquet_path),
+            "source_csv": str(source_csv_path),
+            "source_parquet": str(source_parquet_path),
+        }
+
     def debug_sample_segments(
         self,
         fitsFolder: str,
@@ -670,6 +1069,7 @@ if __name__ == "__main__":
     parser.add_argument("--minSegmentPoints", type=int, default=DEFAULT_MIN_SEGMENT_POINTS, help="Minimum points required in a valid segment")
     parser.add_argument("--minSegmentDuration", type=float, default=DEFAULT_MIN_SEGMENT_DURATION_DAYS, help="Minimum segment duration in days")
     parser.add_argument("--lowFreqPowerRatioThreshold", type=float, default=DEFAULT_LOW_FREQ_POWER_RATIO_THRESHOLD, help="Low-frequency power ratio threshold")
+    parser.add_argument("--driftStrengthThreshold", type=float, default=DEFAULT_SEGMENT_DRIFT_STRENGTH_THRESHOLD, help="Drift-strength threshold for per-segment drift flag (drift = abs(slope*duration) / (1.4826*MAD))")
     parser.add_argument(
         "--summarize",
         action="store_true",
@@ -712,6 +1112,7 @@ if __name__ == "__main__":
         args.minSegmentPoints,
         args.minSegmentDuration,
         args.lowFreqPowerRatioThreshold,
+        args.driftStrengthThreshold,
     )
 
     if args.summarize:
