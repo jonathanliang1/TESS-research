@@ -6,9 +6,8 @@ analysis on low frequencies.
 """
 
 import logging
-import glob
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
@@ -21,13 +20,18 @@ from astropy.timeseries import LombScargle
 # ---------------------------------------------------------------------------
 DEFAULT_LOW_FREQ_POWER_RATIO_THRESHOLD: float = 8.0
 DEFAULT_MIN_FINITE_POINTS: int = 100
+DEFAULT_GAP_THRESHOLD_DAYS: float = 1.0
+DEFAULT_MIN_SEGMENT_POINTS: int = 100
+DEFAULT_MIN_SEGMENT_DURATION_DAYS: float = 5.0
+DEFAULT_SEGMENT_FRACTION_THRESHOLD: float = 0.5
 DEFAULT_LOW_FREQ_N_SAMPLES: int = 500
 DEFAULT_REF_FREQ_N_SAMPLES: int = 2000
 DEFAULT_REF_FREQ_MAX: float = 24.0          # cycles/day  (1 cycle per hour)
 DEFAULT_LOW_FREQ_PERIOD_MIN_FACTOR: float = 0.5   # period = factor * baseline
 DEFAULT_LOW_FREQ_PERIOD_MAX_FACTOR: float = 2.0   # period = factor * baseline
 DEFAULT_REF_FREQ_MIN_FACTOR: float = 1.5          # refFreqMin = factor * lowFreqMax
-TREND_METHOD: str = "ls_low_frequency_power_v2"
+DEFAULT_DEBUG_SAMPLE_COUNT: int = 5
+TREND_METHOD: str = "ls_segmented_low_frequency_power_v1"
 # ---------------------------------------------------------------------------
 
 
@@ -39,231 +43,277 @@ class TrendDetector:
     def __init__(self):
         self.logger = logging.getLogger("TrendDetector")
 
+    def _empty_segmented_result(
+        self,
+        status: str,
+        lowFreqPowerRatioThreshold: float,
+        numFinitePoints: int = 0,
+        trendBaselineDays: float = np.nan,
+    ) -> Dict:
+        return {
+            "lsLowFrequencyPowerDetected": False,
+            "lsTrendStatus": status,
+            "lsValidSegmentCount": 0,
+            "lsSegmentTrendCount": 0,
+            "lsFractionSegmentsWithLowFreq": np.nan,
+            "lsMaxSegmentLowFreqPowerRatio": np.nan,
+            "lsMedianSegmentLowFreqPowerRatio": np.nan,
+            "lsTrendMethod": TREND_METHOD,
+            "lsTrendNumFinitePoints": numFinitePoints,
+            "lsTrendBaselineDays": trendBaselineDays,
+            "lsLowFreqPowerRatioThreshold": lowFreqPowerRatioThreshold,
+            # Optional compatibility diagnostics derived from the strongest segment.
+            "lsLowFreqPowerRatio": np.nan,
+            "lsLowFreqMaxPower": np.nan,
+            "lsRefMedianPower": np.nan,
+            "lsLowFreqMin": np.nan,
+            "lsLowFreqMax": np.nan,
+            "lsRefFreqMin": np.nan,
+            "lsRefFreqMax": np.nan,
+        }
+
+    def _split_into_segments(
+        self,
+        time: np.ndarray,
+        flux: np.ndarray,
+        gapThresholdDays: float,
+    ) -> List[Tuple[np.ndarray, np.ndarray]]:
+        if len(time) == 0:
+            return []
+
+        dt = np.diff(time)
+        segment_breaks = np.where(dt > gapThresholdDays)[0] + 1
+        segment_starts = np.concatenate(([0], segment_breaks))
+        segment_ends = np.concatenate((segment_breaks, [len(time)]))
+
+        return [
+            (time[start:end], flux[start:end])
+            for start, end in zip(segment_starts, segment_ends)
+            if end > start
+        ]
+
+    def _analyze_segment(
+        self,
+        segmentTime: np.ndarray,
+        segmentFlux: np.ndarray,
+        lowFreqPowerRatioThreshold: float,
+        minSegmentPoints: int,
+        minSegmentDuration: float,
+    ) -> Optional[Dict]:
+        num_points = len(segmentTime)
+        if num_points < minSegmentPoints:
+            return None
+
+        segment_duration = float(segmentTime[-1] - segmentTime[0])
+        if segment_duration < minSegmentDuration:
+            return None
+
+        low_freq_min = 1.0 / (DEFAULT_LOW_FREQ_PERIOD_MAX_FACTOR * segment_duration)
+        low_freq_max = 1.0 / (DEFAULT_LOW_FREQ_PERIOD_MIN_FACTOR * segment_duration)
+        ref_freq_min = DEFAULT_REF_FREQ_MIN_FACTOR * low_freq_max
+        ref_freq_max = DEFAULT_REF_FREQ_MAX
+
+        if not np.isfinite(segment_duration) or segment_duration <= 0:
+            return None
+        if not np.isfinite(ref_freq_min) or ref_freq_min >= ref_freq_max:
+            return None
+
+        try:
+            time_zeroed = segmentTime - segmentTime[0]
+
+            low_freq_range = np.linspace(low_freq_min, low_freq_max, DEFAULT_LOW_FREQ_N_SAMPLES)
+            low_ls = LombScargle(time_zeroed, segmentFlux, normalization="psd")
+            low_power = low_ls.power(low_freq_range)
+            low_freq_max_power = float(np.nanmax(low_power))
+
+            ref_freq_range = np.linspace(ref_freq_min, ref_freq_max, DEFAULT_REF_FREQ_N_SAMPLES)
+            ref_ls = LombScargle(time_zeroed, segmentFlux, normalization="psd")
+            ref_power = ref_ls.power(ref_freq_range)
+            ref_median_power = float(np.nanmedian(ref_power))
+        except Exception:
+            return None
+
+        if not np.isfinite(low_freq_max_power):
+            return None
+        if not np.isfinite(ref_median_power) or ref_median_power <= 0:
+            return None
+
+        low_freq_power_ratio = low_freq_max_power / ref_median_power
+        if not np.isfinite(low_freq_power_ratio):
+            return None
+
+        return {
+            "segmentDuration": segment_duration,
+            "segmentNumPoints": num_points,
+            "segmentLowFreqMin": float(low_freq_min),
+            "segmentLowFreqMax": float(low_freq_max),
+            "segmentRefFreqMin": float(ref_freq_min),
+            "segmentRefFreqMax": float(ref_freq_max),
+            "segmentLowFreqMaxPower": low_freq_max_power,
+            "segmentRefMedianPower": ref_median_power,
+            "segmentLowFreqPowerRatio": float(low_freq_power_ratio),
+            "segmentHasLowFreqPower": low_freq_power_ratio >= lowFreqPowerRatioThreshold,
+        }
+
+    def _load_time_flux_from_raw_fits(self, rawFitsPath: str) -> Tuple[np.ndarray, np.ndarray]:
+        with fits.open(rawFitsPath, memmap=False) as hdul:
+            if len(hdul) <= 1 or hdul[1].data is None:
+                raise ValueError("Missing table data in HDU[1]")
+
+            table = hdul[1].data
+            names = set(getattr(table, "names", []) or [])
+            if "TIME" not in names or "FLUX" not in names:
+                raise ValueError("HDU[1] must contain TIME and FLUX columns")
+
+            time = np.asarray(table["TIME"], dtype=float)
+            flux = np.asarray(table["FLUX"], dtype=float)
+
+        return time, flux
+
     def detectLongTermTrendWithLS(
         self,
         rawFitsPath: str,
         minFinitePoints: int = DEFAULT_MIN_FINITE_POINTS,
         lowFreqPowerRatioThreshold: float = DEFAULT_LOW_FREQ_POWER_RATIO_THRESHOLD,
+        gapThresholdDays: float = DEFAULT_GAP_THRESHOLD_DAYS,
+        minSegmentPoints: int = DEFAULT_MIN_SEGMENT_POINTS,
+        minSegmentDuration: float = DEFAULT_MIN_SEGMENT_DURATION_DAYS,
     ) -> Dict:
         """
-        Detect long-term low-frequency power excess in a light curve using Lomb-Scargle.
-
-        Decision is ratio-based only: lsLowFreqPowerRatio >= lowFreqPowerRatioThreshold.
-        lowFreqMaxPower is stored as a diagnostic value only.
-
-        Frequency bands (cycles/day):
-            low-frequency : [1/(2*baseline), 1/(0.5*baseline)]
-            reference     : [1.5*lowFreqMax, 24.0]
+        Detect low-frequency power excess within contiguous observing segments.
 
         Args:
             rawFitsPath: Path to the pipeline-generated raw FITS file
             minFinitePoints: Minimum number of finite TIME/FLUX points required
             lowFreqPowerRatioThreshold: Ratio threshold for low-frequency flag
+            gapThresholdDays: Start a new segment when time gaps exceed this value
+            minSegmentPoints: Minimum points required for a valid segment
+            minSegmentDuration: Minimum duration in days required for a valid segment
 
         Returns:
-            Dict with keys:
-                lsLowFrequencyPowerDetected (bool)
-                lsTrendStatus (str): "low_frequency_power" | "no_low_frequency_power"
-                                     | "insufficient_data" | "failed"
-                lsLowFreqPowerRatio (float)
-                lsLowFreqMaxPower (float)   – diagnostic only
-                lsRefMedianPower (float)    – diagnostic only
-                lsTrendBaselineDays (float)
-                lsTrendNumFinitePoints (int)
-                lsTrendMethod (str)
-                lsLowFreqPowerRatioThreshold (float)
-                lsRefFreqMin (float)
-                lsRefFreqMax (float)
-                lsLowFreqMin (float)
-                lsLowFreqMax (float)
+            Segment-aware trend metadata for one stitched light curve.
         """
-        _insufficient: Dict = {
-            "lsLowFrequencyPowerDetected": False,
-            "lsTrendStatus": "insufficient_data",
-            "lsLowFreqPowerRatio": np.nan,
-            "lsLowFreqMaxPower": np.nan,
-            "lsRefMedianPower": np.nan,
-            "lsTrendBaselineDays": np.nan,
-            "lsTrendNumFinitePoints": 0,
-            "lsTrendMethod": TREND_METHOD,
-            "lsLowFreqPowerRatioThreshold": lowFreqPowerRatioThreshold,
-            "lsRefFreqMin": np.nan,
-            "lsRefFreqMax": np.nan,
-            "lsLowFreqMin": np.nan,
-            "lsLowFreqMax": np.nan,
-        }
-
         try:
-            # ------------------------------------------------------------------
-            # 1. Load pipeline-generated raw FITS table from HDU[1]
-            # ------------------------------------------------------------------
             self.logger.info(f"Loading raw FITS file: {rawFitsPath}")
-            with fits.open(rawFitsPath, memmap=False) as hdul:
-                if len(hdul) <= 1 or hdul[1].data is None:
-                    raise ValueError("Missing table data in HDU[1]")
-
-                table = hdul[1].data
-                names = set(getattr(table, "names", []) or [])
-                if "TIME" not in names or "FLUX" not in names:
-                    raise ValueError("HDU[1] must contain TIME and FLUX columns")
-
-                time = np.asarray(table["TIME"], dtype=float)
-                flux = np.asarray(table["FLUX"], dtype=float)
+            time, flux = self._load_time_flux_from_raw_fits(rawFitsPath)
 
             self.logger.debug(f"Initial time/flux size: {len(time)}")
-
-            # ------------------------------------------------------------------
-            # 2. Finite-point filter
-            # ------------------------------------------------------------------
             finite_mask = np.isfinite(time) & np.isfinite(flux)
             time_finite = time[finite_mask]
             flux_finite = flux[finite_mask]
+
+            if len(time_finite) == 0:
+                return self._empty_segmented_result(
+                    status="insufficient_data",
+                    lowFreqPowerRatioThreshold=lowFreqPowerRatioThreshold,
+                    numFinitePoints=0,
+                )
+
+            sort_idx = np.argsort(time_finite)
+            time_finite = time_finite[sort_idx]
+            flux_finite = flux_finite[sort_idx]
             num_finite = len(time_finite)
+
+            full_baseline_days = float(time_finite[-1] - time_finite[0]) if num_finite > 1 else np.nan
             self.logger.info(f"Finite time/flux points: {num_finite}")
 
             if num_finite < minFinitePoints:
-                self.logger.warning(
-                    f"Insufficient data: {num_finite} < {minFinitePoints} required"
+                return self._empty_segmented_result(
+                    status="insufficient_data",
+                    lowFreqPowerRatioThreshold=lowFreqPowerRatioThreshold,
+                    numFinitePoints=num_finite,
+                    trendBaselineDays=full_baseline_days,
                 )
-                result = dict(_insufficient)
-                result["lsTrendNumFinitePoints"] = num_finite
-                return result
 
-            # ------------------------------------------------------------------
-            # 3. Baseline check
-            # ------------------------------------------------------------------
-            time_normalized = time_finite - time_finite[0]
-            baseline_days = float(time_normalized[-1] - time_normalized[0])
-            if baseline_days <= 0:
-                self.logger.warning(f"Non-positive baseline: {baseline_days}")
-                result = dict(_insufficient)
-                result["lsTrendNumFinitePoints"] = num_finite
-                result["lsTrendBaselineDays"] = baseline_days
-                return result
-
-            self.logger.info(f"Baseline duration: {baseline_days:.2f} days")
-
-            # ------------------------------------------------------------------
-            # 4. Frequency bands
-            # ------------------------------------------------------------------
-            low_freq_min = 1.0 / (DEFAULT_LOW_FREQ_PERIOD_MAX_FACTOR * baseline_days)
-            low_freq_max = 1.0 / (DEFAULT_LOW_FREQ_PERIOD_MIN_FACTOR * baseline_days)
-            ref_freq_min = DEFAULT_REF_FREQ_MIN_FACTOR * low_freq_max
-            ref_freq_max = DEFAULT_REF_FREQ_MAX
-
-            self.logger.debug(
-                f"Low-freq band: {low_freq_min:.6f} – {low_freq_max:.6f} cycles/day"
-            )
-            self.logger.debug(
-                f"Ref-freq band: {ref_freq_min:.6f} – {ref_freq_max:.6f} cycles/day"
+            segments = self._split_into_segments(time_finite, flux_finite, gapThresholdDays)
+            self.logger.info(
+                f"Split into {len(segments)} contiguous segments using gapThresholdDays={gapThresholdDays}"
             )
 
-            if ref_freq_min >= ref_freq_max:
-                self.logger.warning(
-                    f"Reference band degenerate: refFreqMin={ref_freq_min:.6f} >= refFreqMax={ref_freq_max:.6f}"
+            valid_segments: List[Dict] = []
+            for segment_time, segment_flux in segments:
+                segment_result = self._analyze_segment(
+                    segmentTime=segment_time,
+                    segmentFlux=segment_flux,
+                    lowFreqPowerRatioThreshold=lowFreqPowerRatioThreshold,
+                    minSegmentPoints=minSegmentPoints,
+                    minSegmentDuration=minSegmentDuration,
                 )
-                result = dict(_insufficient)
-                result.update({
-                    "lsTrendNumFinitePoints": num_finite,
-                    "lsTrendBaselineDays": baseline_days,
-                    "lsLowFreqMin": low_freq_min,
-                    "lsLowFreqMax": low_freq_max,
-                    "lsRefFreqMin": ref_freq_min,
-                    "lsRefFreqMax": ref_freq_max,
-                })
-                return result
+                if segment_result is not None:
+                    valid_segments.append(segment_result)
 
-            # ------------------------------------------------------------------
-            # 5. Lomb-Scargle over low-frequency band
-            # ------------------------------------------------------------------
-            low_freq_range = np.linspace(low_freq_min, low_freq_max, DEFAULT_LOW_FREQ_N_SAMPLES)
-            ls_low = LombScargle(time_normalized, flux_finite, normalization="psd")
-            low_freq_power = ls_low.power(low_freq_range)
-            low_freq_max_power = float(np.max(low_freq_power))
-            self.logger.info(f"Low-freq max power: {low_freq_max_power:.6f}")
+            valid_segment_count = len(valid_segments)
+            self.logger.info(f"Valid segments retained: {valid_segment_count}")
 
-            # ------------------------------------------------------------------
-            # 6. Lomb-Scargle over reference band
-            # ------------------------------------------------------------------
-            ref_freq_range = np.linspace(ref_freq_min, ref_freq_max, DEFAULT_REF_FREQ_N_SAMPLES)
-            ls_ref = LombScargle(time_normalized, flux_finite, normalization="psd")
-            ref_freq_power = ls_ref.power(ref_freq_range)
-            ref_median_power = float(np.median(ref_freq_power))
-            self.logger.info(f"Ref median power: {ref_median_power:.6f}")
-
-            # ------------------------------------------------------------------
-            # 7. Safety: reference median must be finite and positive
-            # ------------------------------------------------------------------
-            if not np.isfinite(ref_median_power) or ref_median_power <= 0:
-                self.logger.warning(
-                    f"Reference median power invalid: {ref_median_power}"
+            if valid_segment_count == 0:
+                return self._empty_segmented_result(
+                    status="insufficient_data",
+                    lowFreqPowerRatioThreshold=lowFreqPowerRatioThreshold,
+                    numFinitePoints=num_finite,
+                    trendBaselineDays=full_baseline_days,
                 )
-                result = dict(_insufficient)
-                result.update({
-                    "lsTrendNumFinitePoints": num_finite,
-                    "lsTrendBaselineDays": baseline_days,
-                    "lsLowFreqMaxPower": low_freq_max_power,
-                    "lsRefMedianPower": ref_median_power,
-                    "lsLowFreqMin": low_freq_min,
-                    "lsLowFreqMax": low_freq_max,
-                    "lsRefFreqMin": ref_freq_min,
-                    "lsRefFreqMax": ref_freq_max,
-                })
-                return result
 
-            # ------------------------------------------------------------------
-            # 8. Ratio-based decision only
-            # ------------------------------------------------------------------
-            low_freq_power_ratio = low_freq_max_power / ref_median_power
-            self.logger.info(f"Low-freq power ratio: {low_freq_power_ratio:.4f} (threshold={lowFreqPowerRatioThreshold})")
+            segment_trend_count = int(sum(segment["segmentHasLowFreqPower"] for segment in valid_segments))
+            segment_ratios = [segment["segmentLowFreqPowerRatio"] for segment in valid_segments]
+            max_segment_ratio = float(np.max(segment_ratios))
+            median_segment_ratio = float(np.median(segment_ratios))
+            fraction_segments_with_low_freq = segment_trend_count / valid_segment_count
 
-            low_freq_detected = low_freq_power_ratio >= lowFreqPowerRatioThreshold
+            strongest_segment = max(valid_segments, key=lambda segment: segment["segmentLowFreqPowerRatio"])
+            low_freq_detected = (
+                max_segment_ratio >= lowFreqPowerRatioThreshold
+                or fraction_segments_with_low_freq >= DEFAULT_SEGMENT_FRACTION_THRESHOLD
+            )
             trend_status = "low_frequency_power" if low_freq_detected else "no_low_frequency_power"
 
-            if low_freq_detected:
-                self.logger.warning(
-                    f"LOW-FREQUENCY POWER DETECTED: ratio={low_freq_power_ratio:.4f}"
-                )
-            else:
-                self.logger.info(
-                    f"No low-frequency power: ratio={low_freq_power_ratio:.4f}"
-                )
+            self.logger.info(
+                "Segment summary: valid=%d trend=%d fraction=%.3f max_ratio=%.3f median_ratio=%.3f",
+                valid_segment_count,
+                segment_trend_count,
+                fraction_segments_with_low_freq,
+                max_segment_ratio,
+                median_segment_ratio,
+            )
 
             return {
                 "lsLowFrequencyPowerDetected": low_freq_detected,
                 "lsTrendStatus": trend_status,
-                "lsLowFreqPowerRatio": float(low_freq_power_ratio),
-                "lsLowFreqMaxPower": low_freq_max_power,
-                "lsRefMedianPower": ref_median_power,
-                "lsTrendBaselineDays": baseline_days,
-                "lsTrendNumFinitePoints": num_finite,
+                "lsValidSegmentCount": valid_segment_count,
+                "lsSegmentTrendCount": segment_trend_count,
+                "lsFractionSegmentsWithLowFreq": float(fraction_segments_with_low_freq),
+                "lsMaxSegmentLowFreqPowerRatio": max_segment_ratio,
+                "lsMedianSegmentLowFreqPowerRatio": median_segment_ratio,
                 "lsTrendMethod": TREND_METHOD,
+                "lsTrendNumFinitePoints": num_finite,
+                "lsTrendBaselineDays": float(strongest_segment["segmentDuration"]),
                 "lsLowFreqPowerRatioThreshold": lowFreqPowerRatioThreshold,
-                "lsRefFreqMin": float(ref_freq_min),
-                "lsRefFreqMax": float(ref_freq_max),
-                "lsLowFreqMin": float(low_freq_min),
-                "lsLowFreqMax": float(low_freq_max),
+                # Optional compatibility diagnostics from the strongest segment.
+                "lsLowFreqPowerRatio": float(strongest_segment["segmentLowFreqPowerRatio"]),
+                "lsLowFreqMaxPower": float(strongest_segment["segmentLowFreqMaxPower"]),
+                "lsRefMedianPower": float(strongest_segment["segmentRefMedianPower"]),
+                "lsLowFreqMin": float(strongest_segment["segmentLowFreqMin"]),
+                "lsLowFreqMax": float(strongest_segment["segmentLowFreqMax"]),
+                "lsRefFreqMin": float(strongest_segment["segmentRefFreqMin"]),
+                "lsRefFreqMax": float(strongest_segment["segmentRefFreqMax"]),
             }
 
         except Exception as e:
             self.logger.exception(f"Trend detection failed for {rawFitsPath}: {e}")
-            return {
-                "lsLowFrequencyPowerDetected": False,
-                "lsTrendStatus": "failed",
-                "lsLowFreqPowerRatio": np.nan,
-                "lsLowFreqMaxPower": np.nan,
-                "lsRefMedianPower": np.nan,
-                "lsTrendBaselineDays": np.nan,
-                "lsTrendNumFinitePoints": 0,
-                "lsTrendMethod": TREND_METHOD,
-                "lsLowFreqPowerRatioThreshold": lowFreqPowerRatioThreshold,
-                "lsRefFreqMin": np.nan,
-                "lsRefFreqMax": np.nan,
-                "lsLowFreqMin": np.nan,
-                "lsLowFreqMax": np.nan,
-            }
+            return self._empty_segmented_result(
+                status="failed",
+                lowFreqPowerRatioThreshold=lowFreqPowerRatioThreshold,
+            )
 
-    def _process_single_row(self, idx: int, row: pd.Series, fits_folder: Path) -> Tuple[int, dict]:
+    def _process_single_row(
+        self,
+        idx: int,
+        row: pd.Series,
+        fits_folder: Path,
+        gapThresholdDays: float,
+        minSegmentPoints: int,
+        minSegmentDuration: float,
+        lowFreqPowerRatioThreshold: float,
+    ) -> Tuple[int, dict]:
         """
         Process a single row for trend detection.
 
@@ -275,21 +325,10 @@ class TrendDetector:
         Returns:
             Tuple of (idx, results_dict) using the v2 field names
         """
-        _failed: dict = {
-            "lsLowFrequencyPowerDetected": False,
-            "lsTrendStatus": "failed",
-            "lsLowFreqPowerRatio": np.nan,
-            "lsLowFreqMaxPower": np.nan,
-            "lsRefMedianPower": np.nan,
-            "lsTrendBaselineDays": np.nan,
-            "lsTrendNumFinitePoints": 0,
-            "lsTrendMethod": TREND_METHOD,
-            "lsLowFreqPowerRatioThreshold": DEFAULT_LOW_FREQ_POWER_RATIO_THRESHOLD,
-            "lsRefFreqMin": np.nan,
-            "lsRefFreqMax": np.nan,
-            "lsLowFreqMin": np.nan,
-            "lsLowFreqMax": np.nan,
-        }
+        _failed: dict = self._empty_segmented_result(
+            status="failed",
+            lowFreqPowerRatioThreshold=lowFreqPowerRatioThreshold,
+        )
 
         # Extract VSX ID to find raw FITS file
         vsx_id = row.get("VSXId")
@@ -309,10 +348,26 @@ class TrendDetector:
         self.logger.debug(f"Row {idx} ({vsx_id}): Found raw FITS file: {raw_fits_path}")
 
         # Run trend detection
-        trend_result = self.detectLongTermTrendWithLS(raw_fits_path)
+        trend_result = self.detectLongTermTrendWithLS(
+            rawFitsPath=raw_fits_path,
+            lowFreqPowerRatioThreshold=lowFreqPowerRatioThreshold,
+            gapThresholdDays=gapThresholdDays,
+            minSegmentPoints=minSegmentPoints,
+            minSegmentDuration=minSegmentDuration,
+        )
         return idx, trend_result
 
-    def run(self, metaParquetFile: str, fitsFolder: str, maxWorkers: int = 16, outputPath: Optional[str] = None) -> str:
+    def run(
+        self,
+        metaParquetFile: str,
+        fitsFolder: str,
+        maxWorkers: int = 16,
+        outputPath: Optional[str] = None,
+        gapThresholdDays: float = DEFAULT_GAP_THRESHOLD_DAYS,
+        minSegmentPoints: int = DEFAULT_MIN_SEGMENT_POINTS,
+        minSegmentDuration: float = DEFAULT_MIN_SEGMENT_DURATION_DAYS,
+        lowFreqPowerRatioThreshold: float = DEFAULT_LOW_FREQ_POWER_RATIO_THRESHOLD,
+    ) -> str:
         """
         Process a metadata parquet file and run low-frequency trend detection on
         associated raw FITS files using a thread pool.
@@ -322,6 +377,10 @@ class TrendDetector:
             fitsFolder: Folder containing raw FITS light curve files
             maxWorkers: Maximum number of worker threads (default: 16)
             outputPath: Output directory path (optional; default: same folder as input)
+            gapThresholdDays: Split stitched light curves into segments on gaps > this many days
+            minSegmentPoints: Minimum points required in a valid segment
+            minSegmentDuration: Minimum duration in days required in a valid segment
+            lowFreqPowerRatioThreshold: Ratio threshold applied to each segment
 
         Returns:
             Path to the output parquet file with trend detection results
@@ -335,6 +394,12 @@ class TrendDetector:
         trend_columns = [
             "lsLowFrequencyPowerDetected",
             "lsTrendStatus",
+            "lsValidSegmentCount",
+            "lsSegmentTrendCount",
+            "lsFractionSegmentsWithLowFreq",
+            "lsMaxSegmentLowFreqPowerRatio",
+            "lsMedianSegmentLowFreqPowerRatio",
+            # Optional compatibility diagnostics
             "lsLowFreqPowerRatio",
             "lsLowFreqMaxPower",
             "lsRefMedianPower",
@@ -362,16 +427,28 @@ class TrendDetector:
         no_low_freq_count = 0
         insufficient_count = 0
         failed_count = 0
+        stars_with_valid_segments = 0
+        segment_count_distribution: Dict[int, int] = {}
         total = len(df)
 
         self.logger.info(
             f"Starting low-frequency trend detection with {maxWorkers} worker threads "
-            f"(ratio threshold={DEFAULT_LOW_FREQ_POWER_RATIO_THRESHOLD})"
+            f"(ratio threshold={lowFreqPowerRatioThreshold}, gap={gapThresholdDays}d, "
+            f"minSegmentPoints={minSegmentPoints}, minSegmentDuration={minSegmentDuration}d)"
         )
 
         with ThreadPoolExecutor(max_workers=maxWorkers) as executor:
             futures = {
-                executor.submit(self._process_single_row, idx, df.loc[idx], fits_folder): idx
+                executor.submit(
+                    self._process_single_row,
+                    idx,
+                    df.loc[idx],
+                    fits_folder,
+                    gapThresholdDays,
+                    minSegmentPoints,
+                    minSegmentDuration,
+                    lowFreqPowerRatioThreshold,
+                ): idx
                 for idx in df.index
             }
 
@@ -385,6 +462,13 @@ class TrendDetector:
 
                     processed_count += 1
                     status = result_data["lsTrendStatus"]
+                    valid_segment_count = int(result_data.get("lsValidSegmentCount", 0) or 0)
+                    if valid_segment_count > 0:
+                        stars_with_valid_segments += 1
+                    segment_count_distribution[valid_segment_count] = (
+                        segment_count_distribution.get(valid_segment_count, 0) + 1
+                    )
+
                     if status == "low_frequency_power":
                         low_freq_count += 1
                     elif status == "no_low_frequency_power":
@@ -398,6 +482,7 @@ class TrendDetector:
                         self.logger.info(
                             f"Progress: {processed_count}/{total} processed "
                             f"| low_freq={low_freq_count} no_low_freq={no_low_freq_count} "
+                            f"| valid_segments>0={stars_with_valid_segments} "
                             f"| insufficient={insufficient_count} failed={failed_count}"
                         )
 
@@ -421,83 +506,157 @@ class TrendDetector:
         self.logger.info("Low-Frequency Trend Detection Summary")
         self.logger.info(f"  Total rows in parquet : {total}")
         self.logger.info(f"  Processed             : {processed_count}")
+        self.logger.info(f"  >=1 valid segment     : {stars_with_valid_segments}  ({pct(stars_with_valid_segments)})")
         self.logger.info(f"  Low-freq detected     : {low_freq_count}  ({pct(low_freq_count)})")
         self.logger.info(f"  No low-freq           : {no_low_freq_count}  ({pct(no_low_freq_count)})")
         self.logger.info(f"  Insufficient data     : {insufficient_count}  ({pct(insufficient_count)})")
         self.logger.info(f"  Failed                : {failed_count}  ({pct(failed_count)})")
+        self.logger.info("  Segment count distribution:")
+        for segment_count in sorted(segment_count_distribution):
+            self.logger.info(
+                f"    segments={segment_count}: {segment_count_distribution[segment_count]} stars"
+            )
         self.logger.info("=" * 60)
+
+        self.summarize_outputs(output_path, output_dir)
 
         return str(output_path)
 
-    def summarize_by_family(self, trendParquetFile: str, outputDir: Optional[str] = None) -> str:
-        """
-        Read a trend-result parquet file and compute per-family aggregation statistics.
+    def _build_summary_df(self, df: pd.DataFrame, groupColumn: str) -> pd.DataFrame:
+        working_df = df.copy()
+        if groupColumn not in working_df.columns:
+            self.logger.warning("Column '%s' not found – using 'unknown'", groupColumn)
+            working_df[groupColumn] = "unknown"
 
-        Saves a CSV named trend_detection_family_summary.csv alongside the parquet
-        (or in outputDir if provided) and logs the table.
+        working_df[groupColumn] = working_df[groupColumn].fillna("unknown")
+        rows = []
+        for group_value, grp in working_df.groupby(groupColumn, sort=True):
+            total_count = len(grp)
+            detected = grp["lsLowFrequencyPowerDetected"].fillna(False).astype(bool)
+            low_freq_count = int(detected.sum())
+            rows.append(
+                {
+                    groupColumn: group_value,
+                    "total": total_count,
+                    "low_freq_count": low_freq_count,
+                    "percent": round(100.0 * low_freq_count / total_count, 2) if total_count else 0.0,
+                }
+            )
+
+        return pd.DataFrame(rows)
+
+    def summarize_outputs(self, trendParquetFile: str, outputDir: Optional[str] = None) -> Dict[str, str]:
+        """
+        Read a trend-result parquet file and compute per-family and per-source summaries.
+
+        Saves CSV files alongside the parquet (or in outputDir if provided).
 
         Args:
             trendParquetFile: Path to the parquet file produced by run()
-            outputDir: Directory for the CSV (default: same as trendParquetFile)
+            outputDir: Directory for the CSV files (default: same as trendParquetFile)
 
         Returns:
-            Path to the saved CSV file
+            Dictionary of output CSV paths
         """
-        self.logger.info(f"Loading trend parquet for family summary: {trendParquetFile}")
+        self.logger.info(f"Loading trend parquet for summaries: {trendParquetFile}")
         df = pd.read_parquet(trendParquetFile)
-
-        if "Family" not in df.columns:
-            self.logger.warning("Column 'Family' not found – using 'unknown' for all rows")
-            df["Family"] = "unknown"
-
-        total_rows = len(df)
-        rows = []
-        for family, grp in df.groupby("Family", sort=True):
-            n_total = len(grp)
-            detected = grp["lsLowFrequencyPowerDetected"].fillna(False).astype(bool)
-            n_low_freq = int(detected.sum())
-
-            ratios = pd.to_numeric(grp["lsLowFreqPowerRatio"], errors="coerce")
-            status_col = grp["lsTrendStatus"] if "lsTrendStatus" in grp.columns else pd.Series(dtype=str)
-            n_insufficient = int((status_col == "insufficient_data").sum())
-            n_failed = int((status_col == "failed").sum())
-
-            rows.append({
-                "family": family,
-                "total_count": n_total,
-                "low_freq_count": n_low_freq,
-                "low_freq_percent": round(100.0 * n_low_freq / n_total, 2) if n_total else 0.0,
-                "median_low_freq_power_ratio": round(float(ratios.median()), 4) if ratios.notna().any() else np.nan,
-                "p75_low_freq_power_ratio": round(float(ratios.quantile(0.75)), 4) if ratios.notna().any() else np.nan,
-                "p90_low_freq_power_ratio": round(float(ratios.quantile(0.90)), 4) if ratios.notna().any() else np.nan,
-                "insufficient_data_count": n_insufficient,
-                "failed_count": n_failed,
-            })
-
-        summary_df = pd.DataFrame(rows)
-
-        # Determine output path
         out_dir = Path(outputDir) if outputDir else Path(trendParquetFile).parent
         out_dir.mkdir(parents=True, exist_ok=True)
-        csv_path = out_dir / "trend_detection_family_summary.csv"
-        summary_df.to_csv(csv_path, index=False)
-        self.logger.info(f"Family summary saved to {csv_path}")
 
-        # Log summary table
+        family_summary_df = self._build_summary_df(df, "family")
+        source_summary_df = self._build_summary_df(df, "provenance")
+
+        family_csv_path = out_dir / "trend_detection_family_summary.csv"
+        source_csv_path = out_dir / "trend_detection_source_summary.csv"
+        family_summary_df.to_csv(family_csv_path, index=False)
+        source_summary_df.to_csv(source_csv_path, index=False)
+
+        self.logger.info(f"Family summary saved to {family_csv_path}")
+        self.logger.info(f"Source summary saved to {source_csv_path}")
+
         self.logger.info("=" * 80)
-        self.logger.info(f"Family-Level Low-Frequency Trend Detection Summary  (total rows: {total_rows})")
-        self.logger.info(f"{'Family':<30} {'Total':>7} {'LF':>7} {'LF%':>7} {'MedRatio':>10} {'P75':>10} {'P90':>10} {'Insuf':>6} {'Fail':>5}")
+        self.logger.info("Family-Level Low-Frequency Trend Detection Summary")
+        self.logger.info(f"{'Family':<30} {'Total':>7} {'LF':>7} {'LF%':>7}")
         self.logger.info("-" * 80)
-        for r in rows:
+        for _, row in family_summary_df.iterrows():
             self.logger.info(
-                f"{str(r['family']):<30} {r['total_count']:>7} {r['low_freq_count']:>7} "
-                f"{r['low_freq_percent']:>6.1f}% {r['median_low_freq_power_ratio']:>10.4f} "
-                f"{r['p75_low_freq_power_ratio']:>10.4f} {r['p90_low_freq_power_ratio']:>10.4f} "
-                f"{r['insufficient_data_count']:>6} {r['failed_count']:>5}"
+                f"{str(row['family']):<30} {int(row['total']):>7} {int(row['low_freq_count']):>7} "
+                f"{float(row['percent']):>6.1f}%"
+            )
+        self.logger.info("-" * 80)
+        self.logger.info("Source-Level Low-Frequency Trend Detection Summary")
+        self.logger.info(f"{'Source':<30} {'Total':>7} {'LF':>7} {'LF%':>7}")
+        self.logger.info("-" * 80)
+        for _, row in source_summary_df.iterrows():
+            self.logger.info(
+                f"{str(row['provenance']):<30} {int(row['total']):>7} {int(row['low_freq_count']):>7} "
+                f"{float(row['percent']):>6.1f}%"
             )
         self.logger.info("=" * 80)
 
-        return str(csv_path)
+        return {
+            "family": str(family_csv_path),
+            "source": str(source_csv_path),
+        }
+
+    def summarize_by_family(self, trendParquetFile: str, outputDir: Optional[str] = None) -> str:
+        return self.summarize_outputs(trendParquetFile, outputDir)["family"]
+
+    def debug_sample_segments(
+        self,
+        fitsFolder: str,
+        sampleCount: int = DEFAULT_DEBUG_SAMPLE_COUNT,
+        gapThresholdDays: float = DEFAULT_GAP_THRESHOLD_DAYS,
+        minSegmentPoints: int = DEFAULT_MIN_SEGMENT_POINTS,
+        minSegmentDuration: float = DEFAULT_MIN_SEGMENT_DURATION_DAYS,
+        lowFreqPowerRatioThreshold: float = DEFAULT_LOW_FREQ_POWER_RATIO_THRESHOLD,
+    ) -> None:
+        """
+        Run segmented LS on a small sample of raw FITS files and log segment counts.
+        """
+        fits_folder = Path(fitsFolder)
+        sample_files = sorted(fits_folder.glob("*_raw.fits"))[:sampleCount]
+        self.logger.info(
+            f"Debugging segmented trend detection on {len(sample_files)} sample FITS files"
+        )
+
+        for sample_file in sample_files:
+            try:
+                time, flux = self._load_time_flux_from_raw_fits(str(sample_file))
+                finite_mask = np.isfinite(time) & np.isfinite(flux)
+                time = np.asarray(time[finite_mask], dtype=float)
+                flux = np.asarray(flux[finite_mask], dtype=float)
+                if len(time) == 0:
+                    self.logger.info(f"{sample_file.name}: no finite rows")
+                    continue
+
+                sort_idx = np.argsort(time)
+                time = time[sort_idx]
+                flux = flux[sort_idx]
+                segments = self._split_into_segments(time, flux, gapThresholdDays)
+                segment_ratios = []
+                valid_segment_count = 0
+                for segment_time, segment_flux in segments:
+                    segment_result = self._analyze_segment(
+                        segmentTime=segment_time,
+                        segmentFlux=segment_flux,
+                        lowFreqPowerRatioThreshold=lowFreqPowerRatioThreshold,
+                        minSegmentPoints=minSegmentPoints,
+                        minSegmentDuration=minSegmentDuration,
+                    )
+                    if segment_result is not None:
+                        valid_segment_count += 1
+                        segment_ratios.append(segment_result["segmentLowFreqPowerRatio"])
+
+                self.logger.info(
+                    "%s: total_segments=%d valid_segments=%d ratios=%s",
+                    sample_file.name,
+                    len(segments),
+                    valid_segment_count,
+                    [round(ratio, 3) for ratio in segment_ratios],
+                )
+            except Exception as e:
+                self.logger.exception(f"Debug sample failed for {sample_file}: {e}")
     
 if __name__ == "__main__":
     import argparse
@@ -507,13 +666,18 @@ if __name__ == "__main__":
     parser.add_argument("--fitsFolder", type=str, required=True, help="Folder containing raw FITS files")
     parser.add_argument("--maxWorkers", type=int, default=16, help="Maximum number of worker threads")
     parser.add_argument("--outputPath", type=str, default=None, help="Output directory for trend parquet file (optional)")
+    parser.add_argument("--gapThresholdDays", type=float, default=DEFAULT_GAP_THRESHOLD_DAYS, help="Split segments when time gaps exceed this many days")
+    parser.add_argument("--minSegmentPoints", type=int, default=DEFAULT_MIN_SEGMENT_POINTS, help="Minimum points required in a valid segment")
+    parser.add_argument("--minSegmentDuration", type=float, default=DEFAULT_MIN_SEGMENT_DURATION_DAYS, help="Minimum segment duration in days")
+    parser.add_argument("--lowFreqPowerRatioThreshold", type=float, default=DEFAULT_LOW_FREQ_POWER_RATIO_THRESHOLD, help="Low-frequency power ratio threshold")
     parser.add_argument(
         "--summarize",
         action="store_true",
         default=False,
-        help="After processing, also generate family-level summary CSV",
+        help="Retained for compatibility; summaries are generated automatically",
     )
-    parser.add_argument("--logFile", type=str, default=None, help="Path to log file (optional; logs always go to stdout)")
+    parser.add_argument("--debugSampleCount", type=int, default=0, help="Run segmented-LS debug sampling on the first N raw FITS files")
+    parser.add_argument("--logFile", type=str, default=None, help="Path to log file (optional; when provided logs are written to file only)")
     args = parser.parse_args()
 
     _log_format = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
@@ -529,7 +693,28 @@ if __name__ == "__main__":
         logging.getLogger("TrendDetector").info(f"Logging to file: {args.logFile}")
 
     trend_detector = TrendDetector()
-    output_parquet = trend_detector.run(args.metaParquetFile, args.fitsFolder, args.maxWorkers, args.outputPath)
+    if args.debugSampleCount > 0:
+        trend_detector.debug_sample_segments(
+            fitsFolder=args.fitsFolder,
+            sampleCount=args.debugSampleCount,
+            gapThresholdDays=args.gapThresholdDays,
+            minSegmentPoints=args.minSegmentPoints,
+            minSegmentDuration=args.minSegmentDuration,
+            lowFreqPowerRatioThreshold=args.lowFreqPowerRatioThreshold,
+        )
+
+    output_parquet = trend_detector.run(
+        args.metaParquetFile,
+        args.fitsFolder,
+        args.maxWorkers,
+        args.outputPath,
+        args.gapThresholdDays,
+        args.minSegmentPoints,
+        args.minSegmentDuration,
+        args.lowFreqPowerRatioThreshold,
+    )
 
     if args.summarize:
-        trend_detector.summarize_by_family(output_parquet, args.outputPath)
+        logging.getLogger("TrendDetector").info(
+            "Summaries are generated automatically; --summarize is kept for compatibility."
+        )
