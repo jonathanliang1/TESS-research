@@ -1,8 +1,19 @@
 """
 TrendDetector.py
 
-Detect long-term trends in TESS light curves using Lomb-Scargle periodogram
-analysis on low frequencies.
+Detect slow drift in TESS light curves on a per-segment basis.
+
+Primary method: segment_wise_linear_drift_mad_v1
+    Fits a linear trend to each contiguous observing segment and measures
+    drift as abs(slope * duration) / (1.4826 * MAD).  The star-level flag
+    (robustDriftDetected) is set when fractionSegmentsWithDrift >= 0.5.
+    This is the authoritative trend/flatten decision.
+
+Diagnostic method: ls_segmented_low_frequency_power_v1
+    Runs a Lomb-Scargle periodogram on each segment and checks for excess
+    low-frequency power.  Retained for research diagnostics only; the
+    lsLowFrequencyPowerDetected flag is NOT used as the final trend decision
+    because the false-positive rate on TESS data is ~95%.
 """
 
 import logging
@@ -32,7 +43,7 @@ DEFAULT_LOW_FREQ_PERIOD_MAX_FACTOR: float = 2.0   # period = factor * baseline
 DEFAULT_REF_FREQ_MIN_FACTOR: float = 1.5          # refFreqMin = factor * lowFreqMax
 DEFAULT_DEBUG_SAMPLE_COUNT: int = 5
 TREND_METHOD: str = "ls_segmented_low_frequency_power_v1"
-DEFAULT_SEGMENT_DRIFT_STRENGTH_THRESHOLD: float = 2.5
+DEFAULT_SEGMENT_DRIFT_STRENGTH_THRESHOLD: float = 7.0
 DRIFT_METHOD: str = "segment_wise_linear_drift_mad_v1"
 # ---------------------------------------------------------------------------
 
@@ -258,7 +269,11 @@ class TrendDetector:
         minSegmentDuration: float = DEFAULT_MIN_SEGMENT_DURATION_DAYS,
     ) -> Dict:
         """
-        Detect low-frequency power excess within contiguous observing segments.
+        [DIAGNOSTIC ONLY] Lomb-Scargle low-frequency power check, per segment.
+
+        This method is retained for research diagnostics.  Its output field
+        lsLowFrequencyPowerDetected is NOT the authoritative trend flag.
+        Use detectRobustDrift() / robustDriftDetected for the flatten decision.
 
         Args:
             rawFitsPath: Path to the pipeline-generated raw FITS file
@@ -269,7 +284,7 @@ class TrendDetector:
             minSegmentDuration: Minimum duration in days required for a valid segment
 
         Returns:
-            Segment-aware trend metadata for one stitched light curve.
+            Segment-aware LS diagnostic metadata for one stitched light curve.
         """
         try:
             self.logger.info(f"Loading raw FITS file: {rawFitsPath}")
@@ -397,9 +412,9 @@ class TrendDetector:
         For each segment, computes:
             segmentDriftStrength = abs(slope * segmentDuration) / (1.4826 * MAD)
 
-        Star-level flag uses fraction of segments with drift >= 0.5 OR median
-        drift strength >= threshold.  The max alone is NOT used so that one
-        anomalous segment cannot flag the whole light curve.
+        Star-level flag: robustDriftDetected = fractionSegmentsWithDrift >= 0.5.
+        The max and median drift strength alone are NOT used as the flag;
+        they are stored as diagnostic fields only.
 
         Args:
             rawFitsPath: Path to the pipeline-generated raw FITS file
@@ -464,12 +479,10 @@ class TrendDetector:
             median_strength = float(np.median(strengths))
             fraction_with_drift = drift_count / valid_segment_count
 
-            # Star-level flag: fraction >= 0.5 OR median >= threshold.
-            # Max alone is intentionally NOT used.
-            drift_detected = (
-                fraction_with_drift >= 0.5
-                or median_strength >= driftStrengthThreshold
-            )
+            # Star-level flag: fraction of segments with drift >= 0.5.
+            # Max and median strength alone are intentionally NOT used so that
+            # one anomalous segment cannot flag the entire light curve.
+            drift_detected = fraction_with_drift >= 0.5
             status = "drift" if drift_detected else "no_drift"
 
             self.logger.info(
