@@ -1,0 +1,10 @@
+split,Provenance,accuracy,sample_count
+test,SPOC,0.8507462686567164,67
+test,QLP,0.6758893280632411,253
+test,TESSCut,0.4578313253012048,747
+train,QLP,1.0,1121
+train,SPOC,1.0,324
+train,TESSCut,1.0,3534
+validation,SPOC,0.75,76
+validation,QLP,0.6974789915966386,238
+validation,TESSCut,0.45152722443559096,753
