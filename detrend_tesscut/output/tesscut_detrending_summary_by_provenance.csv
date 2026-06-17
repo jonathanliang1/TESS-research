@@ -1,0 +1,5 @@
+provenance,total,eligible,trend_detected,detrended,median_fraction_segments_with_drift,median_drift_strength,p75_drift_strength,failed,missing_raw,trend_detected_percent,detrended_percent
+QLP,1612,0,0,0,,,,0,0,0.0,0.0
+SPOC,467,0,0,0,,,,0,0,0.0,0.0
+TESSCut,5034,5034,3104,3104,0.5454545454545454,10.31819962715026,29.41372181905359,0,0,61.66,61.66
+,257,0,0,0,,,,0,0,0.0,0.0
